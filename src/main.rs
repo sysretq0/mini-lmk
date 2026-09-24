@@ -44,8 +44,7 @@ struct TelemetryDaemon {
     // Config & exclusions
     exclude_list: HashSet<String>,
     games_list: HashSet<String>,
-    launcher_pkg: Option<String>,
-    ime_pkg: Option<String>,
+    dynamic_system_exclusions: HashSet<String>,
 
     // Tracking state
     current_fg: Option<String>,
@@ -126,8 +125,7 @@ impl TelemetryDaemon {
 
             exclude_list: HashSet::new(),
             games_list: HashSet::new(),
-            launcher_pkg: None,
-            ime_pkg: None,
+            dynamic_system_exclusions: HashSet::new(),
 
             current_fg: None,
             fg_lru: VecDeque::with_capacity(16),
@@ -194,33 +192,46 @@ impl TelemetryDaemon {
     }
 
     fn detect_system_components(&mut self) {
-        // Launcher
-        let out = Command::new("cmd")
-            .args(["package", "resolve-activity", "--brief", "-c", "android.intent.category.HOME", "-a", "android.intent.action.MAIN"])
-            .output();
-        if let Ok(o) = out {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            for line in stdout.lines() {
-                if line.contains('/') && !line.starts_with("priority=") {
-                    if let Some(pkg) = line.trim().split('/').next() {
-                        println!("[SYSTEM] Detected launcher: {}", pkg);
-                        self.launcher_pkg = Some(pkg.to_string());
-                        break;
+        self.dynamic_system_exclusions.clear();
+
+        // 1. Roles via RoleManager (cmd role)
+        let roles = [
+            ("HOME", "android.app.role.HOME"),
+            ("DIALER", "android.app.role.DIALER"),
+            ("SMS", "android.app.role.SMS"),
+        ];
+
+        for (label, role) in roles {
+            if let Ok(o) = Command::new("cmd").args(["role", "get-role-holders", role]).output() {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    let pkg = line.trim();
+                    if !pkg.is_empty() {
+                        println!("[SYSTEM] Detected {}: {}", label, pkg);
+                        self.dynamic_system_exclusions.insert(pkg.to_string());
                     }
                 }
             }
         }
 
-        // Default IME
-        let out_ime = Command::new("settings")
-            .args(["get", "secure", "default_input_method"])
-            .output();
-        if let Ok(o) = out_ime {
+        // 2. Active IME via cmd settings
+        if let Ok(o) = Command::new("cmd").args(["settings", "get", "secure", "default_input_method"]).output() {
             let stdout = String::from_utf8_lossy(&o.stdout);
             if let Some(pkg) = stdout.trim().split('/').next() {
                 if !pkg.is_empty() && pkg != "null" {
                     println!("[SYSTEM] Detected IME: {}", pkg);
-                    self.ime_pkg = Some(pkg.to_string());
+                    self.dynamic_system_exclusions.insert(pkg.to_string());
+                }
+            }
+        }
+
+        // 3. Active Live Wallpaper via cmd settings
+        if let Ok(o) = Command::new("cmd").args(["settings", "get", "secure", "wallpaper_service"]).output() {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let s = stdout.trim();
+            if !s.is_empty() && s != "null" {
+                if let Some(pkg) = s.split('/').next() {
+                    println!("[SYSTEM] Detected Live Wallpaper: {}", pkg);
+                    self.dynamic_system_exclusions.insert(pkg.to_string());
                 }
             }
         }
@@ -333,15 +344,8 @@ impl TelemetryDaemon {
         if self.exclude_list.contains(pkg) {
             return true;
         }
-        if let Some(ref l) = self.launcher_pkg {
-            if l == pkg {
-                return true;
-            }
-        }
-        if let Some(ref ime) = self.ime_pkg {
-            if ime == pkg {
-                return true;
-            }
+        if self.dynamic_system_exclusions.contains(pkg) {
+            return true;
         }
         if let Some(ref cur) = self.current_fg {
             if cur == pkg {
