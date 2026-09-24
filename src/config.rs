@@ -15,13 +15,53 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
-pub const MLMK_CONFIG_DIR: &str = "/data/local/tmp/mlmk/config";
+use std::sync::OnceLock;
 
-pub const MLMK_LOGS_DIR: &str = "/data/local/tmp/mlmk/logs";
-pub const CONFIG_FILE: &str = "/data/local/tmp/mlmk/config/daemon.conf";
-pub const EXCLUDE_FILE: &str = "/data/local/tmp/mlmk/config/exclude.list";
-pub const GAMES_FILE: &str = "/data/local/tmp/mlmk/config/games.list";
-pub const OPERATIONS_LOG: &str = "/data/local/tmp/mlmk/logs/operations.log";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPaths {
+    pub base_dir: String,
+    pub config_dir: String,
+    pub logs_dir: String,
+    pub config_file: String,
+    pub exclude_file: String,
+    pub games_file: String,
+    pub operations_log: String,
+}
+
+impl ConfigPaths {
+    pub fn get() -> &'static ConfigPaths {
+        static INSTANCE: OnceLock<ConfigPaths> = OnceLock::new();
+        INSTANCE.get_or_init(|| {
+            let base_dir = std::env::var("MODPATH")
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| format!("{}/mlmk", p.trim().trim_end_matches('/')))
+                .unwrap_or_else(|| "/data/local/tmp/mlmk".to_string());
+
+            Self::from_base(&base_dir)
+        })
+    }
+
+    pub fn from_base(base: &str) -> Self {
+        let base_dir = base.trim_end_matches('/').to_string();
+        let config_dir = format!("{}/config", base_dir);
+        let logs_dir = format!("{}/logs", base_dir);
+        let config_file = format!("{}/daemon.conf", config_dir);
+        let exclude_file = format!("{}/exclude.list", config_dir);
+        let games_file = format!("{}/games.list", config_dir);
+        let operations_log = format!("{}/operations.log", logs_dir);
+
+        ConfigPaths {
+            base_dir,
+            config_dir,
+            logs_dir,
+            config_file,
+            exclude_file,
+            games_file,
+            operations_log,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -109,6 +149,22 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_config_paths_resolution() {
+        let p_default = ConfigPaths::from_base("/data/local/tmp/mlmk");
+        assert_eq!(p_default.base_dir, "/data/local/tmp/mlmk");
+        assert_eq!(p_default.config_dir, "/data/local/tmp/mlmk/config");
+        assert_eq!(p_default.logs_dir, "/data/local/tmp/mlmk/logs");
+        assert_eq!(p_default.config_file, "/data/local/tmp/mlmk/config/daemon.conf");
+        assert_eq!(p_default.exclude_file, "/data/local/tmp/mlmk/config/exclude.list");
+        assert_eq!(p_default.games_file, "/data/local/tmp/mlmk/config/games.list");
+        assert_eq!(p_default.operations_log, "/data/local/tmp/mlmk/logs/operations.log");
+
+        let p_mod = ConfigPaths::from_base("/data/user_de/0/com.android.shell/axeron/plugins/mini_lmk/mlmk/");
+        assert_eq!(p_mod.base_dir, "/data/user_de/0/com.android.shell/axeron/plugins/mini_lmk/mlmk");
+        assert_eq!(p_mod.config_file, "/data/user_de/0/com.android.shell/axeron/plugins/mini_lmk/mlmk/config/daemon.conf");
+    }
 
     #[test]
     fn test_runtime_config_parse() {

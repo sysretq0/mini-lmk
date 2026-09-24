@@ -1,49 +1,39 @@
 #!/system/bin/sh
 # Copyright (C) 2026 sysretq0
 # SPDX-License-Identifier: GPL-3.0-only
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
 
-# mini-lmk supervisor wrapper script
-MODE="${1:---act}"
-SCRIPT_DIR="${0%/*}"
+MODDIR="${0%/*}"
+[ -n "$MODDIR" ] && [ -d "$MODDIR" ] && export MODPATH="${MODPATH:-$MODDIR}"
 
-# Dynamically locate mini-lmk binary:
-# 1. Prefer command on PATH (e.g., AxManager exports $MODPATH/system/bin into PATH)
-# 2. Check $MODPATH/system/bin/mini-lmk
-# 3. Check adjacent / relative directories
-# 4. Check standalone /data/local/tmp paths
+until [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ] && pidof com.android.systemui >/dev/null 2>&1; do
+    sleep 2
+done
+
 if command -v mini-lmk >/dev/null 2>&1; then
-    BIN="$(command -v mini-lmk)"
+    BIN="mini-lmk"
 elif [ -n "$MODPATH" ] && [ -x "$MODPATH/system/bin/mini-lmk" ]; then
     BIN="$MODPATH/system/bin/mini-lmk"
-elif [ -x "$SCRIPT_DIR/system/bin/mini-lmk" ]; then
-    BIN="$SCRIPT_DIR/system/bin/mini-lmk"
-elif [ -x "$SCRIPT_DIR/mini-lmk" ]; then
-    BIN="$SCRIPT_DIR/mini-lmk"
-elif [ -x "/data/local/tmp/mini-lmk" ]; then
-    BIN="/data/local/tmp/mini-lmk"
-elif [ -x "/data/local/tmp/mlmk/mini-lmk" ]; then
-    BIN="/data/local/tmp/mlmk/mini-lmk"
 else
-    echo "[ERROR] Cannot find executable mini-lmk binary!" >&2
+    case "$(getprop ro.product.cpu.abi 2>/dev/null || uname -m)" in
+        arm64*|aarch64*) ARCH="arm64-v8a" ;;
+        arm*|armeabi*)   ARCH="armeabi-v7a" ;;
+        x86_64*|x64*)    ARCH="x86_64" ;;
+        x86*|i*86*)      ARCH="x86" ;;
+        *)               ARCH="" ;;
+    esac
+    BIN="$MODPATH/bin/$ARCH/mini-lmk"
+fi
+
+[ -f "$BIN" ] && chmod 755 "$BIN" 2>/dev/null
+
+if [ ! -x "$BIN" ] && ! command -v "$BIN" >/dev/null 2>&1; then
+    echo "mini-lmk: binary not found ($BIN)" >&2
     exit 1
 fi
 
-# Ensure runtime directories exist
-mkdir -p /data/local/tmp/mlmk/config /data/local/tmp/mlmk/logs
-[ ! -f /data/local/tmp/mlmk/config/exclude.list ] && touch /data/local/tmp/mlmk/config/exclude.list
-[ ! -f /data/local/tmp/mlmk/config/games.list ] && touch /data/local/tmp/mlmk/config/games.list
-
-echo "[$(date)] mini-lmk supervisor started. Binary: $BIN ($MODE)"
+MODE="${1:---act}"
 
 while true; do
-    echo "[$(date)] Starting mini-lmk ($MODE)..."
     "$BIN" "$MODE"
-    EXIT_CODE=$?
-    echo "[$(date)] mini-lmk exited with code $EXIT_CODE. Restarting in 1s..."
-    sleep 1
+    sleep 2
 done

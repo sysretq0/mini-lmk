@@ -103,6 +103,11 @@ impl TelemetrySink {
             .append(true)
             .open(&self.log_path)
             .ok();
+        #[cfg(unix)]
+        if file.is_some() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.log_path, fs::Permissions::from_mode(0o666));
+        }
         self.writer = file.map(|f| BufWriter::with_capacity(8192, f));
     }
 
@@ -111,6 +116,11 @@ impl TelemetrySink {
         self.writer = None;
         let old_path = format!("{}.old", &self.log_path);
         let _ = fs::rename(&self.log_path, &old_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&old_path, fs::Permissions::from_mode(0o666));
+        }
         self.open_file();
         self.bytes_written = 0;
     }

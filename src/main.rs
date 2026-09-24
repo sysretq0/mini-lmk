@@ -21,10 +21,7 @@ mod parser;
 mod procfs;
 mod telemetry;
 
-use config::{
-    RuntimeConfig, CONFIG_FILE, EXCLUDE_FILE, GAMES_FILE, MLMK_CONFIG_DIR, MLMK_LOGS_DIR,
-    OPERATIONS_LOG,
-};
+use config::{ConfigPaths, RuntimeConfig};
 use hasher::{FastMap, FastSet};
 use parser::{parse_logcat_line, LogcatEvent, ProcDiedEvent, ProcStartEvent, ResumeActivityEvent};
 use procfs::{check_mem_critical, read_statm_rss_kb, read_total_ram_mb};
@@ -116,8 +113,9 @@ impl DaemonState {
             libc::sigaction(libc::SIGPIPE, &sa_ign, std::ptr::null_mut());
         }
 
-        let _ = fs::create_dir_all(MLMK_CONFIG_DIR);
-        let _ = fs::create_dir_all(MLMK_LOGS_DIR);
+        let paths = ConfigPaths::get();
+        let _ = fs::create_dir_all(&paths.config_dir);
+        let _ = fs::create_dir_all(&paths.logs_dir);
 
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epoll_fd < 0 {
@@ -140,7 +138,7 @@ impl DaemonState {
             std::process::exit(1);
         }
 
-        let telemetry = TelemetrySink::new(OPERATIONS_LOG, json_stdout);
+        let telemetry = TelemetrySink::new(&paths.operations_log, json_stdout);
 
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page_size_kb = if page_size > 0 { (page_size as u64) / 1024 } else { 4 };
@@ -278,15 +276,17 @@ impl DaemonState {
 
     fn ensure_inotify_watch(&mut self) {
         if self.inotify_fd >= 0 {
-            let _ = fs::create_dir_all(MLMK_CONFIG_DIR);
-            let dir_c = CString::new(MLMK_CONFIG_DIR).unwrap();
-            let mask = libc::IN_CLOSE_WRITE
-                | libc::IN_MOVED_TO
-                | libc::IN_CREATE
-                | libc::IN_DELETE
-                | libc::IN_DELETE_SELF
-                | libc::IN_MOVE_SELF;
-            unsafe { libc::inotify_add_watch(self.inotify_fd, dir_c.as_ptr(), mask) };
+            let paths = ConfigPaths::get();
+            let _ = fs::create_dir_all(&paths.config_dir);
+            if let Ok(dir_c) = CString::new(paths.config_dir.as_str()) {
+                let mask = libc::IN_CLOSE_WRITE
+                    | libc::IN_MOVED_TO
+                    | libc::IN_CREATE
+                    | libc::IN_DELETE
+                    | libc::IN_DELETE_SELF
+                    | libc::IN_MOVE_SELF;
+                unsafe { libc::inotify_add_watch(self.inotify_fd, dir_c.as_ptr(), mask) };
+            }
         }
     }
 
@@ -305,9 +305,10 @@ impl DaemonState {
 
     fn reload_configs(&mut self) {
         let prev_cfg = self.config;
-        self.config.load_from_file(CONFIG_FILE);
-        Self::load_file_lines(EXCLUDE_FILE, &mut self.user_exclusions);
-        Self::load_file_lines(GAMES_FILE, &mut self.games);
+        let paths = ConfigPaths::get();
+        self.config.load_from_file(&paths.config_file);
+        Self::load_file_lines(&paths.exclude_file, &mut self.user_exclusions);
+        Self::load_file_lines(&paths.games_file, &mut self.games);
 
         if self.config != prev_cfg {
             let now_epoch = Self::get_epoch_ms();

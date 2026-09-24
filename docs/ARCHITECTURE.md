@@ -141,7 +141,7 @@ A critical design trade-off in `mini-lmk` is the **deliberate deferral of PID li
 
 To protect user multi-tasking state against activity re-entrance and auth overlays (e.g. Google Sign-In `SignInHubActivity`, intent choosers, payment gateways, ad SDK trampolines):
 * **Transient Session Detection:** When an app departs the foreground after $< 500\text{ ms}$ (`prev_dur_ms < 500`), it is classified as a transient trampoline rather than an intentional user application session.
-* **LRU De-pollution:** The transient package is immediately pruned from `fg_lru`. This prevents rapid flash activities from displacing genuine user applications from the LRU protection window ($< \text{lru_protect_depth}$), preserving user app state across auth redirects and deep links.
+* **LRU De-pollution:** The transient package is immediately pruned from `fg_lru`. This prevents rapid flash activities from displacing genuine user applications from the LRU protection window ($< \text{lru\_protect\_depth}$), preserving user app state across auth redirects and deep links.
 
 ---
 
