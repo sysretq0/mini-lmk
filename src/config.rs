@@ -1,4 +1,22 @@
+// Copyright (C) 2026 sysretq0
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: GPL-3.0-only
+
 pub const MLMK_CONFIG_DIR: &str = "/data/local/tmp/mlmk/config";
+
 pub const MLMK_LOGS_DIR: &str = "/data/local/tmp/mlmk/logs";
 pub const CONFIG_FILE: &str = "/data/local/tmp/mlmk/config/daemon.conf";
 pub const EXCLUDE_FILE: &str = "/data/local/tmp/mlmk/config/exclude.list";
@@ -22,7 +40,7 @@ impl Default for RuntimeConfig {
             lru_protect_depth: 3,
             mem_critical_percent: 10,
             fg_lru_max_depth: 10,
-            screen_off_harvest: false,
+            screen_off_harvest: true,
             max_kills_per_pass: 2,
         }
     }
@@ -99,7 +117,7 @@ mod tests {
         assert_eq!(cfg.lru_protect_depth, 3);
         assert_eq!(cfg.mem_critical_percent, 10);
         assert_eq!(cfg.fg_lru_max_depth, 10);
-        assert!(!cfg.screen_off_harvest);
+        assert!(cfg.screen_off_harvest);
         assert_eq!(cfg.max_kills_per_pass, 2);
 
         let content = "
@@ -109,7 +127,7 @@ mod tests {
             lru_protect_depth = 5
             mem_critical_percent = 15
             fg_lru_max_depth = 20
-            screen_off_harvest = true
+            screen_off_harvest = false
             max_kills_per_pass = 4
             # Unknown keys should be safely ignored
             invalid_key = 999
@@ -119,7 +137,7 @@ mod tests {
         assert_eq!(cfg.lru_protect_depth, 5);
         assert_eq!(cfg.mem_critical_percent, 15);
         assert_eq!(cfg.fg_lru_max_depth, 20);
-        assert!(cfg.screen_off_harvest);
+        assert!(!cfg.screen_off_harvest);
         assert_eq!(cfg.max_kills_per_pass, 4);
 
         // Enforce lower bound of 1

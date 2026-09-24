@@ -1,141 +1,168 @@
 # mini-lmk
 
-An unprivileged, event-driven userspace memory manager for Android 10+ (API 29–37+).
+An event-driven userspace memory manager for Android 10+ (API 29–37+) running under Android shell privileges (UID 2000, non-root).
 
-`mini-lmk` eliminates UI stutter and frame drops caused by kernel direct-reclaim path thrashing by proactively evicting stale background applications during natural foreground transition animations. It operates strictly via an asynchronous 2-file-descriptor `epoll` reactor, maintaining a **~1.12 MB PSS footprint** with **0% idle CPU utilization**.
+`mini-lmk` preempts kernel direct-reclaim thrashing and native `lmkd` stalls by proactively evicting stale background applications during natural foreground transition animations and background spawn events. Operating strictly via a single-threaded 2-file-descriptor `epoll` reactor, it maintains an operational footprint of **~1.12 MB PSS** with **0% idle CPU utilization**.
 
 ---
 
 ## Key Highlights
 
-* **Zero-Allocation Hot Paths:** Processes `logcat` event buffers and `/proc` filesystem metrics using stack-allocated buffers and zero-copy byte slicing.
-* **Animation-Masked Eviction:** Reaping evaluations execute strictly upon activity resumption events (`wm_resume_activity` / `am_resume_activity`), hiding eviction latency behind native 200–300 ms window transition animations.
-* **Non-Blocking Asynchronous Reaping:** Calls `/system/bin/cmd activity kill` asynchronously via `posix_spawn` with non-blocking child reaping (`libc::waitpid(-1, ..., WNOHANG)`), preventing reactor lockups while keeping 99th-percentile UI render times flat.
-* **SoC Sleep Sympathy:** Respects deep sleep states. It tracks background churn passively during screen-off intervals and defers cache cleanups to monotonic clock boundaries upon unlock.
-* **Bounded Disk Overhead:** Dual-stream telemetry outputs compact human-readable tables to the terminal and maintains an NDJSON operations log with automatic 512 KB log rotation.
-* **Compact Footprint:** Single statically linked ELF binary (~360 KB stripped) with zero external crate dependencies beyond standard Rust and POSIX Bionic wrappers.
+* **Rootless / Shell-Privileged:** Operates under standard Android shell permissions (UID `2000`, `u:r:shell:s0` via ADB or Shizuku). Requires zero root, KernelSU, Magisk, or custom SELinux modifications while retaining access to the framework's `cmd activity` IPC interface and `logcat` event buffers.
+* **Zero-Allocation Hot Paths:** Parses binary logcat event streams and `/proc` metrics using stack-allocated buffers and zero-copy byte slicing. Zero heap allocations during steady-state reactor operations.
+* **Animation-Masked Eviction:** Reaping evaluations triggered by application switching (`wm_resume_activity` / `am_resume_activity`) mask framework kill latency behind native 200–300 ms window transition animations.
+* **Unconstrained Marker Architecture:** Intercepts background process creation (`am_proc_start`) while ignoring foreground task launches, resolving single-app inactivity deadlocks during extended stationary sessions without synthetic polling timers.
+* **Non-Blocking Asynchronous Reaping:** Dispatches `cmd activity kill --user all <pkg>` asynchronously via `posix_spawn` with non-blocking child harvesting (`libc::waitpid(-1, ..., WNOHANG)`), keeping UI render thread latency flat.
+* **External Process Supervision:** Follows fail-fast systems design. If the upstream logcat pipe yields `EOF` or `EPOLLHUP`, the daemon exits immediately and cleanly, delegating process resurrection to an external supervisor loop (`run-daemon.sh`).
+* **Hardware-Scaled Burst Limits:** Automatically tunes eviction burst limits (`max_kills_per_pass`) to physical RAM detected at startup, protecting system_server Binder IPC queues from saturation.
+* **Bounded Disk Footprint:** Dual-output telemetry sink maintains an aligned human-readable terminal table alongside structured NDJSON operations logging with automatic 512 KB log rotation.
 
 ---
 
 ## Architecture Overview
 
-
 ```
-┌────────────────────────┐
-│ logcat -b events -v tag│
-└───────────┬────────────┘
-│ (Pipe Stream)
-▼
-┌─────────────────────────┐       ┌──────────────────────┐
-│ /config/ Directory      │       │  TOKEN_LOGCAT_PIPE   │
-│ (inotify watches)       │       └──────────┬───────────┘
-└───────────┬─────────────┘                  │
-│ (Inotify Events)               │
-▼                                ▼
-┌───────────────────────┐         ┌──────────────────────┐
-│     TOKEN_INOTIFY     │         │ Zero-Copy Tag Parser │
-└───────────┬───────────┘         └──────────┬───────────┘
-│                                │
-└───────────────┬────────────────┘
-▼
-┌──────────────────────────┐
-│    epoll_pwait Reactor   │
-└────────────┬─────────────┘
-│
-┌────────────┴─────────────┐
-│                          │
-Foreground Switch              Spawn / Death
-▼                          ▼
-┌───────────────────────┐   ┌──────────────────────┐
-│ Evaluate LRU & Idle   │   │ Update AppRecord &   │
-│ Pipeline (Gates 1-3)  │   │ Session Churn Stats  │
-└───────────┬───────────┘   └──────────────────────┘
-▼
-┌───────────────────────┐
-│ /system/bin/cmd spawn │ ──► (Reaped via WNOHANG)
-└───────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│                      epoll_wait()                      │
+└───────────────────────────┬────────────────────────────┘
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+              ▼                           ▼
+     [TOKEN_LOGCAT_PIPE]           [TOKEN_INOTIFY]
+    (logcat -b events -v tag)  (/data/local/tmp/mlmk/config/)
+              │                           │
+              ▼                           ▼
+    Zero-Copy Event Parser       Hot-Reload Configs
+              │
+    ┌─────────┴────────────────────────────────┐
+    │                                          │
+Foreground Switch                      Background Spawn
+(wm_resume_activity)                   (am_proc_start)
+    │                                          │
+    ▼                                          ▼
+[Evaluate 3-Gate Pipeline]             [If !is_fg_launch: Evaluate]
+    │
+    ├─► Gate 1: Static & Dynamic Exclusions (IME, Launcher, Dialer, SMS, exclude.list)
+    ├─► Gate 2: LRU Recency Protection Window (lru_protect_depth)
+    └─► Gate 3: Adaptive Idle Age (T_idle >= 180s, or 0s on Game Mode / Low RAM)
+    │
+    ▼
+Sort Candidates Descending by RSS (/proc/<pid>/statm)
+    │
+    ▼
+Dispatch: cmd activity kill --user all <pkg>
+    │
+    ├── Immediately evicts package from alive_apps (prevents duplicate kills)
+    └── Retains pid_to_pkg mappings (guarantees accurate am_proc_died telemetry)
 ```
-
-### Eviction Pipeline Gates
-
-When a foreground transition occurs, candidate packages are filtered through three consecutive gates:
-
-1. **Exclusion Gate:** System components (IME, Home launcher, Default SMS/Dialer), live wallpapers, and user-defined exclusions (`exclude.list`) are bypassed immediately.
-2. **LRU Protection Gate:** The most recently used applications within `lru_protect_depth` (default: 3) are preserved regardless of idle duration.
-3. **Idle Duration Gate:** Remaining background packages must have been inactive for at least $T_{\text{idle}}$ (default: 180s).
-   * *Escalation:* When a game session starts (`games.list`) or available memory drops below `mem_critical_percent`, $T_{\text{idle}}$ drops to 0s for immediate cache reclamation.
 
 ---
 
 ## Directory Structure
 
-
-```
-src/
-├── config.rs       # RuntimeConfig parsing (daemon.conf) & directory definitions
-├── hasher.rs       # In-tree 64-bit FNV-1a non-cryptographic hasher
-├── parser.rs       # Zero-allocation event log parser with AOSP/vendor fallbacks
-├── procfs.rs       # Stack-buffered /proc readers (statm, cmdline, meminfo)
-├── telemetry.rs    # Dual-output TelemetrySink with 512 KB log rotation
-└── main.rs         # Epoll event loop, lifecycle state machine, and child reaper
+```text
+mini-lmk/
+├── .cargo/
+│   └── config.toml          # Target configuration and linker rustflags
+├── Cargo.toml               # Package manifest and release profile optimizations
+├── LICENSE                  # GNU General Public License v3.0
+├── README.md                # Project documentation and quickstart
+├── run-daemon.sh            # Target hardware supervisor loop
+├── docs/
+│   └── ARCHITECTURE.md      # Complete architectural specification & reference
+└── src/
+    ├── config.rs            # Runtime configuration parsing (daemon.conf)
+    ├── hasher.rs            # In-tree 64-bit FNV-1a hasher (zero-dependency)
+    ├── parser.rs            # Zero-allocation event log tokenizer and fallbacks
+    ├── procfs.rs            # Stack-buffered /proc readers (statm, meminfo, cmdline)
+    ├── telemetry.rs         # Dual-output TelemetrySink with 512 KB log rotation
+    └── main.rs              # Epoll reactor, state machine, and eviction pipeline
 ```
 
 ---
 
 ## Configuration
 
-Configuration files reside under `/data/local/tmp/mlmk/config/` and are hot-reloaded automatically via `inotify`:
+Configuration files reside under `/data/local/tmp/mlmk/config/` and are automatically hot-reloaded via `inotify` when modified:
 
 ### `daemon.conf`
-Key-value runtime parameters:
+
+Live runtime parameters:
+
 ```ini
-# Core idle timeout and LRU protection
+# Base background idle timeout before eviction eligibility (seconds)
 t_idle_sec=180
+
+# Number of recently visited foreground packages immune from eviction
 lru_protect_depth=3
+
+# Low-memory watermark (percentage of MemTotal) triggering emergency T_idle=0s
 mem_critical_percent=10
+
+# Maximum depth of the foreground history ring buffer
 fg_lru_max_depth=10
 
-# Aggressive memory cleanup during screen-off/standby
-# When true: drops LRU protection to 1 and accelerates idle timeouts while screen is off.
-# When false: preserves standard LRU protection depth and timeouts regardless of screen state.
-screen_off_harvest=false
+# Deep screen-off harvesting (drops LRU depth to 1 and accelerates idle decay)
+screen_off_harvest=true
 
 # Maximum background apps evicted per reap pass (burst cap)
 # Defaults auto-scale by physical RAM: <=4.5GB -> 4, 4.5GB-8.5GB -> 2, >8.5GB -> 1
 # max_kills_per_pass=2
 ```
-### **exclude.list**
-Package names to protect from eviction (one per line):
-```text
-com.spotify.music
-org.thoughtcrime.securesms
 
-```
-### **games.list**
-Applications that trigger Game Mode escalation (T_{\text{idle}} \to 0) upon launch:
-```text
-com.miHoYo.GenshinImpact
-com.dts.freefireth
+### `exclude.list`
 
+Package names shielded from termination under all conditions (one per line). **Empty by default out of the box**; populated by the user as needed:
+
+```text
+# Example user exclusions (file is empty by default out of the box)
+# com.spotify.music
+# moe.shizuku.privileged.api
 ```
-## **Building**
-Cross-compilation targets aarch64-linux-android with Android NDK API 29+ compatibility:
+
+### `games.list`
+
+Applications that trigger immediate Game Mode memory reclamation ($T_{\text{idle}} \to 0\text{s}$) upon focus. **Empty by default out of the box**; populated by the user as needed:
+
+```text
+# Example game profiles (file is empty by default out of the box)
+# com.miHoYo.GenshinImpact
+# com.proximabeta.nikke
+```
+
+---
+
+## Building
+
+Cross-compilation targets `aarch64-linux-android` using Android NDK (API 29+ compatibility):
+
 ```bash
-# Add cross-compilation target
+# Add rust target
 rustup target add aarch64-linux-android
 
-# Build stripped release binary
+# Build optimized release binary
 cargo build --release --target aarch64-linux-android
-llvm-strip target/aarch64-linux-android/release/mini-lmk
 
+# Run unit test suite
+cargo test --target aarch64-unknown-linux-gnu
 ```
-## **Running on Target**
-Deploy to an adb root or privileged environment:
+
+The release profile compiles with `opt-level = "z"`, fat LTO, symbol stripping, and single codegen units, generating a stripped native ELF under 400 KB.
+
+---
+
+## Running on Target
+
+Deploy to standard Android shell (`adb shell` / UID 2000):
+
 ```bash
-# 1. Push binary and setup directory layout
+# 1. Push binary and initialize directory structure (empty lists out of the box)
 adb push target/aarch64-linux-android/release/mini-lmk /data/local/tmp/mini-lmk
-adb shell chmod +x /data/local/tmp/mini-lmk
-adb shell mkdir -p /data/local/tmp/mlmk/config /data/local/tmp/mlmk/logs
+adb push run-daemon.sh /data/local/tmp/mlmk/run-daemon.sh
+adb shell "chmod +x /data/local/tmp/mini-lmk /data/local/tmp/mlmk/run-daemon.sh"
+adb shell "mkdir -p /data/local/tmp/mlmk/config /data/local/tmp/mlmk/logs"
+adb shell "touch /data/local/tmp/mlmk/config/exclude.list /data/local/tmp/mlmk/config/games.list"
 
 # 2. Run in observation mode (simulate evictions without executing kills)
 adb shell /data/local/tmp/mini-lmk --observe
@@ -143,12 +170,25 @@ adb shell /data/local/tmp/mini-lmk --observe
 # 3. Run in active enforcement mode
 adb shell /data/local/tmp/mini-lmk --act
 
-# 4. Optional: Emit raw NDJSON to stdout instead of tabular columnar layout
-adb shell /data/local/tmp/mini-lmk --act --json
-
+# 4. Run via background supervisor loop
+adb shell "nohup /data/local/tmp/mlmk/run-daemon.sh --act > /data/local/tmp/mlmk/logs/stdout.log 2>&1 &"
 ```
-## **Telemetry & Monitoring**
-Live operations are formatted into aligned terminal columns on standard output:
+
+### Command-Line Arguments
+
+| Flag | Description |
+|---|---|
+| `--observe` | Run in observation mode (emits telemetry and simulates candidate kills; default). |
+| `--act` | Run in active enforcement mode (`cmd activity kill --user all <pkg>`). |
+| `--json` | Output raw NDJSON directly to stdout instead of the formatted columnar table. |
+| `-h`, `--help` | Display usage and help message. |
+
+---
+
+## Telemetry & Monitoring
+
+Live operations are formatted into aligned columns on standard output:
+
 ```text
 # TIME         EVENT        TARGET                     DETAIL / REASON
 --------------------------------------------------------------------------------
@@ -157,18 +197,28 @@ Live operations are formatted into aligned terminal columns on standard output:
 14:23:15.800   SCREEN_OFF   --                         active_session=74.6s
 14:25:40.200   SCREEN_ON    --                         sleep=144s  bg_spawns=5  rss_added=+64MB
 14:25:40.201   BG_SUMMARY   --                         interval=144s  spawns=5  deaths=4  rss_delta=+12MB
-
 ```
-All operations are simultaneously recorded to /data/local/tmp/mlmk/logs/operations.log in NDJSON format, automatically rotating to operations.log.old at 512 KB.
-## **Verified Device Performance**
-Profiled on physical Android target hardware (MediaTek MT6789 / Helio G99, API 34, aarch64):
+
+All operations are simultaneously written to `/data/local/tmp/mlmk/logs/operations.log` in NDJSON format, automatically rotating to `operations.log.old` upon exceeding 512 KB.
+
+---
+
+## Verified Device Performance
+
+Profiled on physical target hardware (MediaTek MT6789 / Helio G99, Android 14 API 34, aarch64):
+
 | Metric | Measured Baseline | Target Budget |
 |---|---|---|
 | **Steady-State PSS** | **1,120 kB (~1.12 MB)** | < 2,500 kB |
 | **Private Dirty RAM** | **704 kB** | < 1,000 kB |
 | **Idle CPU Utilization** | **0.017% (task-clock 3.4 ms / 20s)** | < 0.10% |
-| **Event Loop Sleeping Ratio** | **99.97% (epoll_pwait)** | > 98.0% |
+| **Event Loop Sleeping Ratio** | **99.97% (epoll_wait)** | > 98.0% |
 | **Reap Loop Reactor Impact** | **~5.2 ms** (via non-blocking spawn) | < 20 ms |
 | **99th Percentile UI Frame Time** | **22–36 ms** (13.8% drop in UI jank) | < 50 ms |
 | **Steady-State Steady Allocations** | **0 bytes** (zero heap churn) | 0 bytes |
 
+---
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0** (`GPL-3.0-only`). See the [`LICENSE`](LICENSE) file for the complete license terms.

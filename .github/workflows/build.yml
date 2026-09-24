@@ -1,0 +1,86 @@
+name: Build & Package AxManager Plugin
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    name: Build Multi-ABI AxManager Plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            aarch64-linux-android
+            armv7-linux-androideabi
+            x86_64-linux-android
+            i686-linux-android
+
+      - name: Setup Android NDK (Latest Stable r30)
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r30
+          add-to-path: true
+
+      - name: Run Test Suite
+        run: cargo test --verbose
+
+      - name: Build All Android ABIs
+        env:
+          NDK_TOOLCHAIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+        run: |
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/aarch64-linux-android29-clang"
+          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$NDK_TOOLCHAIN/armv7a-linux-androideabi29-clang"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/x86_64-linux-android29-clang"
+          export CARGO_TARGET_I686_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/i686-linux-android29-clang"
+
+          export RUSTFLAGS="-C link-arg=-Wl,--gc-sections -C link-arg=-Wl,-z,relro,-z,now -C link-arg=-Wl,--as-needed"
+
+          echo "=== Building aarch64-linux-android (arm64-v8a) ==="
+          cargo build --release --target aarch64-linux-android
+
+          echo "=== Building armv7-linux-androideabi (armeabi-v7a) ==="
+          cargo build --release --target armv7-linux-androideabi
+
+          echo "=== Building x86_64-linux-android (x86_64) ==="
+          cargo build --release --target x86_64-linux-android
+
+          echo "=== Building i686-linux-android (x86) ==="
+          cargo build --release --target i686-linux-android
+
+      - name: Package AxManager Plugin Zip
+        run: |
+          chmod +x package.sh
+          ./package.sh
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-lmk-axmanager
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

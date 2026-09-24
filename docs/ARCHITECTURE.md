@@ -1,6 +1,6 @@
 # Architecture Specification & Technical Reference: mini-lmk
 
-mini-lmk is an unprivileged, 100% single-threaded, event-driven memory management daemon for Android 10+ (API 29–37+). It preempts kernel memory thrashing and native lmkd direct-reclaim stalls by tracking application idle durations via native system log events, evicting stale background applications cleanly through Android framework APIs.
+mini-lmk is a rootless, 100% single-threaded, event-driven memory management daemon operating under Android shell privileges (UID 2000, API 29–37+). It preempts kernel memory thrashing and native lmkd direct-reclaim stalls by tracking application idle durations via native system log events, evicting stale background applications cleanly through Android framework APIs.
 
 ---
 
@@ -8,7 +8,7 @@ mini-lmk is an unprivileged, 100% single-threaded, event-driven memory managemen
 
 ### 1.1 Execution Boundaries & Security Context
 
-* **Identity:** UID `2000` (`shell`), GID `2000` (`shell`), supplementary GID `1007` (`log`).
+* **Identity:** UID `2000` (`shell`), GID `2000` (`shell`), supplementary GID `1007` (`log`). Rootless execution relying on platform shell privileges (accessible via ADB or Shizuku).
 * **SELinux Domain:** `u:r:shell:s0` (Stock enforcing domain; zero root, KernelSU, Magisk, or custom sepolicy modifications required).
 * **Single-Threaded & Fail-Fast:** Operates strictly on a single thread. It maintains no complex in-process reconnection state machines: if the logcat stream closes, yields `EPOLLHUP`, or encounters unrecoverable read errors, the daemon exits immediately (`exit(1)`). Process supervision and restarts are delegated externally to an init service or shell supervisor loop.
 * **Footprint:** Single native binary compiled for `aarch64-linux-android` against Bionic `libc` (< 400 KB stripped ELF; < 4 MB RSS operational footprint).
@@ -251,27 +251,27 @@ t_idle_sec=180
 lru_protect_depth=3
 mem_critical_percent=10
 fg_lru_max_depth=10
+screen_off_harvest=true
 ```
 
 #### Exclusions (`config/exclude.list`)
 
-Package names immune from eviction under all conditions:
+Package names immune from eviction under all conditions (one per line). **Empty by default out of the box**; populated by the user for critical background services or tools:
 
 ```text
-# Critical background daemons and tools
-com.tailscale.ipn
-moe.shizuku.privileged.api
-com.sysretq0.reterminal
+# Example user exclusions (file ships empty by default out of the box)
+# com.tailscale.ipn
+# moe.shizuku.privileged.api
 ```
 
 #### Game Profiles (`config/games.list`)
 
-Package names triggering Game Mode entry flushing:
+Package names triggering Game Mode entry flushing ($T_{\text{idle}} \to 0\text{s}$). **Empty by default out of the box**; populated by the user for high-demand 3D gaming workloads:
 
 ```text
-# High-demand gaming workloads
-com.miHoYo.GenshinImpact
-com.proximabeta.nikke
+# Example game targets (file ships empty by default out of the box)
+# com.miHoYo.GenshinImpact
+# com.proximabeta.nikke
 ```
 
 ### 5.2 Telemetry Logging Format (`logs/operations.log`)
@@ -286,4 +286,10 @@ The daemon writes structured Newline-Delimited JSON (NDJSON) using standard user
 {"ts":1790255286893,"event":"kill","pkg":"com.facebook.katana","pids":[3939],"rss_freed_est_kb":842324,"reason":"idle_expired","idle_sec":412,"lru_pos":5,"spawned":true}
 {"ts":1790255287102,"event":"game_intrusion","pid":12763,"uid":10130,"pkg":"com.google.android.calculator","proc":"com.google.android.calculator","type":"service","rss_kb":45200,"excluded":false}
 ```
+
+---
+
+## 6. Licensing & Distribution
+
+This project is licensed under the **GNU General Public License v3.0** (`GPL-3.0-only`). See the [`LICENSE`](../LICENSE) file for complete terms and legal text.
 
