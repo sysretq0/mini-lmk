@@ -24,7 +24,7 @@ The daemon runs a pure push-based event loop with zero polling wakeups. The exec
                         |                        |
                         v                        v
                [TOKEN_LOGCAT_PIPE]        [TOKEN_INOTIFY]
-              (Native Event Stream)    (/data/local/tmp/mlmk/config/)
+              (Native Event Stream)       (<base>/config/)
                         |                        |
                         v                        v
                Lifecycle State Machine    Hot-Reload Configs
@@ -33,7 +33,7 @@ The daemon runs a pure push-based event loop with zero polling wakeups. The exec
 | Token | Descriptor Type | Source / Path | Trigger Condition | Reactor Action |
 |---|---|---|---|---|
 | `TOKEN_LOGCAT_PIPE` | Non-blocking Pipe (`O_NONBLOCK`) | Output of child `logcat` | Log buffer write | Parse event tag; update in-memory lifecycle state; evaluate reaping gates. Exits process on EOF/HUP. |
-| `TOKEN_INOTIFY` | Linux inotify | Watch on `/data/local/tmp/mlmk/config/` (`CLOSE_WRITE` \| `MOVED_TO`) | Config modified | Instantly reloads `exclude.list` and `games.list` in memory without dropping state. |
+| `TOKEN_INOTIFY` | Linux inotify | Watch on `<base>/config/` (`CLOSE_WRITE` \| `MOVED_TO`) | Config modified | Instantly reloads `exclude.list` and `games.list` in memory without dropping state. |
 
 ### 1.3 Unified Native Event Stream
 
@@ -132,7 +132,7 @@ struct DaemonState {
 ### 2.1 Lazy / Opportunistic PID Retaining
 
 A critical design trade-off in `mini-lmk` is the **deliberate deferral of PID liveliness checks for protected applications**:
-* **Why Non-Candidates Are Not Probed:** In any running Android system, dozens of apps reside in protected states (LRU position $< \text{depth}$, or idle time $< T_{\text{idle}}$). Actively polling or probing `/proc/<pid>/statm` for all tracked PIDs on every event would continuously wake CPU cores, thrash VFS caches, and disrupt low-power C-states—violating `mini-lmk`'s zero-overhead guarantee.
+* **Why Non-Candidates Are Not Probed:** In any running Android system, dozens of apps reside in protected states (LRU position `< depth`, or idle time `< T_idle`). Actively polling or probing `/proc/<pid>/statm` for all tracked PIDs on every event would continuously wake CPU cores, thrash VFS caches, and disrupt low-power C-states—violating `mini-lmk`'s zero-overhead guarantee.
 * **Event-Driven Eager Cleanup:** Under normal execution, the logcat stream delivers `am_proc_died` events synchronously whenever processes exit, naturally unmapping PIDs and removing dead apps.
 * **Opportunistic Candidate Reconciliation:** If an unmonitored or silent exit occurs, the PID is retained lazily in memory at zero cost until the enclosing package ages out of protection and qualifies as an eviction candidate. During candidate evaluation, targeted `/proc/<pid>/statm` probes verify PID existence. Dead PIDs and departed packages discovered during this probe are instantly purged (`dead_pids`, `dead_pkgs`, `record.pids.retain(...)`).
 * **Guarantee:** Candidate ranking and RSS reclamation calculations are strictly based on verified alive PIDs, with 0% steady-state CPU overhead.
@@ -140,8 +140,8 @@ A critical design trade-off in `mini-lmk` is the **deliberate deferral of PID li
 ### 2.2 Trampoline & Ephemeral Activity Filtering
 
 To protect user multi-tasking state against activity re-entrance and auth overlays (e.g. Google Sign-In `SignInHubActivity`, intent choosers, payment gateways, ad SDK trampolines):
-* **Transient Session Detection:** When an app departs the foreground after $< 500\text{ ms}$ (`prev_dur_ms < 500`), it is classified as a transient trampoline rather than an intentional user application session.
-* **LRU De-pollution:** The transient package is immediately pruned from `fg_lru`. This prevents rapid flash activities from displacing genuine user applications from the LRU protection window ($< \text{lru\_protect\_depth}$), preserving user app state across auth redirects and deep links.
+* **Transient Session Detection:** When an app departs the foreground after `< 500 ms` (`prev_dur_ms < 500`), it is classified as a transient trampoline rather than an intentional user application session.
+* **LRU De-pollution:** The transient package is immediately pruned from `fg_lru`. This prevents rapid flash activities from displacing genuine user applications from the LRU protection window (`< lru_protect_depth`), preserving user app state across auth redirects and deep links.
 
 ---
 
@@ -205,17 +205,17 @@ When multiple candidate packages qualify for eviction simultaneously:
 
 1. The daemon reads column 2 (resident pages × `PAGE_SIZE`) from `/proc/<pid>/statm` **strictly for the qualified candidates**. Any PIDs returning 0 RSS (`ENOENT` caused by process exit missed during rare logcat ring buffer drops) are opportunistically purged from `pid_to_pkg` and `record.pids`. If all PIDs for a candidate have exited, the stale package entry is deleted from `alive_apps`—achieving self-healing state reconciliation with zero periodic `/proc` filesystem sweeps.
 2. Surviving candidates are sorted in **descending order of RSS** (reclaiming the largest memory footprints first).
-3. **Hardware-Scaled Burst Limit (`max_kills_per_pass`):** Only the top $N$ candidates are evicted in a single pass to bound reactor latency and prevent Binder thread contention in `system_server`. Defaults auto-scale by physical RAM detected from `/proc/meminfo` at startup:
-   * **$\le 4.5\text{ GB}$ RAM:** 4 kills per pass (aggressive recovery on low-RAM devices).
-   * **$4.5\text{ GB} - 8.5\text{ GB}$ RAM:** 2 kills per pass (balanced mainstream devices).
-   * **$> 8.5\text{ GB}$ RAM:** 1 kill per pass (conservative eviction on high-headroom flagships).
+3. **Hardware-Scaled Burst Limit (`max_kills_per_pass`):** Only the top N candidates are evicted in a single pass to bound reactor latency and prevent Binder thread contention in `system_server`. Defaults auto-scale by physical RAM detected from `/proc/meminfo` at startup:
+   * **<= 4.5 GB RAM:** 4 kills per pass (aggressive recovery on low-RAM devices).
+   * **4.5 GB - 8.5 GB RAM:** 2 kills per pass (balanced mainstream devices).
+   * **> 8.5 GB RAM:** 1 kill per pass (conservative eviction on high-headroom flagships).
    * Can be overridden at runtime via `max_kills_per_pass` in `daemon.conf`.
 
 ---
 
 ## 4. Provisional Tuning Constants (Telemetry Calibration)
 
-The following parameters are provisional configuration variables. Their default values serve as baseline estimates and are subject to calibration based on empirical traces recorded in `/data/local/tmp/mlmk/logs/operations.log`:
+The following parameters are provisional configuration variables. Their default values serve as baseline estimates and are subject to calibration based on empirical traces recorded in `<base>/logs/operations.log`:
 
 | Parameter | Provisional Default | Description & Calibration Target |
 |---|---|---|
@@ -225,12 +225,12 @@ The following parameters are provisional configuration variables. Their default 
 
 ---
 
-## 5. File Layout & Inotify Isolation (`/data/local/tmp/mlmk/`)
+## 5. File Layout & Inotify Isolation
 
-To prevent inotify feedback loops where log emission re-triggers configuration reloads, configurations and runtime logs are isolated into separate directories:
+To prevent inotify feedback loops where log emission re-triggers configuration reloads, configurations and runtime logs are isolated into separate directories under `<base>` (resolved dynamically to `$MODPATH/mlmk/` when running as an AxManager module, with fallback to `/data/local/tmp/mlmk/` for standalone execution):
 
 ```text
-/data/local/tmp/mlmk/
+<base>/
 ├── config/                  <-- Watched by inotify (TOKEN_INOTIFY)
 │   ├── daemon.conf          <-- Volatile runtime tuning parameters (key=value)
 │   ├── exclude.list
@@ -266,7 +266,7 @@ Package names immune from eviction under all conditions (one per line). **Empty 
 
 #### Game Profiles (`config/games.list`)
 
-Package names triggering Game Mode entry flushing ($T_{\text{idle}} \to 0\text{s}$). **Empty by default out of the box**; populated by the user for high-demand 3D gaming workloads:
+Package names triggering Game Mode entry flushing (`T_idle -> 0s`). **Empty by default out of the box**; populated by the user for high-demand 3D gaming workloads:
 
 ```text
 # Example game targets (file ships empty by default out of the box)

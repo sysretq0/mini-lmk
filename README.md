@@ -30,7 +30,7 @@ An event-driven userspace memory manager for Android 10+ (API 29–37+) running 
               │                           │
               ▼                           ▼
      [TOKEN_LOGCAT_PIPE]           [TOKEN_INOTIFY]
-    (logcat -b events -v tag)  (/data/local/tmp/mlmk/config/)
+    (logcat -b events -v tag)     (<base>/config/)
               │                           │
               ▼                           ▼
     Zero-Copy Event Parser       Hot-Reload Configs
@@ -84,7 +84,7 @@ mini-lmk/
 
 ## Configuration
 
-Configuration files reside under `/data/local/tmp/mlmk/config/` and are automatically hot-reloaded via `inotify` when modified:
+Configuration files reside under `<base>/config/` (dynamically resolved to `$MODPATH/mlmk/config/` in AxManager, or `/data/local/tmp/mlmk/config/` for standalone ADB execution) and are automatically hot-reloaded via `inotify` when modified:
 
 ### `daemon.conf`
 
@@ -123,7 +123,7 @@ Package names shielded from termination under all conditions (one per line). **E
 
 ### `games.list`
 
-Applications that trigger immediate Game Mode memory reclamation ($T_{\text{idle}} \to 0\text{s}$) upon focus. **Empty by default out of the box**; populated by the user as needed:
+Applications that trigger immediate Game Mode memory reclamation (`T_idle -> 0s`) upon focus. **Empty by default out of the box**; populated by the user as needed:
 
 ```text
 # Example game profiles (file is empty by default out of the box)
@@ -199,7 +199,7 @@ Live operations are formatted into aligned columns on standard output:
 14:25:40.201   BG_SUMMARY   --                         interval=144s  spawns=5  deaths=4  rss_delta=+12MB
 ```
 
-All operations are simultaneously written to `/data/local/tmp/mlmk/logs/operations.log` in NDJSON format, automatically rotating to `operations.log.old` upon exceeding 512 KB.
+All operations are simultaneously written to `<base>/logs/operations.log` in NDJSON format, automatically rotating to `operations.log.old` upon exceeding 512 KB.
 
 ---
 
