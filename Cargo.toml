@@ -1,0 +1,27 @@
+[package]
+name = "mini-lmk"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mini-lmk-probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "test-inotify"
+path = "src/bin/test_inotify.rs"
+
+[[bin]]
+name = "mem-pressure"
+path = "src/bin/mem_pressure.rs"
+
+[[bin]]
+name = "test-signals"
+path = "src/bin/test_signals.rs"
+
+[[bin]]
+name = "test-unified-stream"
+path = "src/bin/test_unified_stream.rs"
+
+[dependencies]
+libc = "0.2"

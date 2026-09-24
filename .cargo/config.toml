@@ -1,0 +1,5 @@
+[build]
+target = "aarch64-linux-android"
+
+[target.aarch64-linux-android]
+linker = "/opt/ndk/toolchains/llvm/prebuilt/linux-arm64/bin/aarch64-linux-android34-clang"
