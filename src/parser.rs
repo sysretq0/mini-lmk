@@ -103,7 +103,6 @@ pub fn parse_resume_activity(payload: &str) -> Option<ResumeActivityEvent<'_>> {
         return None;
     }
 
-    // 1. Scan for token containing component separator '/'
     let mut component = "";
     for &tok in &tokens[..count] {
         if tok.contains('/') {
@@ -112,7 +111,6 @@ pub fn parse_resume_activity(payload: &str) -> Option<ResumeActivityEvent<'_>> {
         }
     }
 
-    // 2. Fallback to standard index 3 if component separator not found
     if component.is_empty() && count >= 4 {
         component = tokens[3];
     }
@@ -121,7 +119,6 @@ pub fn parse_resume_activity(payload: &str) -> Option<ResumeActivityEvent<'_>> {
         return None;
     }
 
-    // Extract base package (before '/')
     let pkg = component.split('/').next().unwrap_or(component).trim();
     if pkg.is_empty() || pkg.starts_with('-') {
         return None;
@@ -175,7 +172,6 @@ pub fn parse_proc_start(payload: &str) -> Option<ProcStartEvent<'_>> {
     let mut uid = 0u32;
     let mut proc_idx = None;
 
-    // Look for first positive integer as PID, second integer as UID
     for (i, &tok) in tokens[..count].iter().enumerate() {
         if let Ok(val) = tok.parse::<u32>() {
             if pid == 0 && i > 0 {
@@ -243,8 +239,7 @@ pub fn parse_proc_died(payload: &str) -> Option<ProcDiedEvent> {
         }
     }
 
-    // Dynamic fallback: scan for first positive integer beyond user_id (token 0)
-    for &tok in tokens[1..count].iter() {
+    for &tok in tokens[2..count].iter() {
         if let Ok(pid) = tok.parse::<u32>() {
             if pid > 0 {
                 return Some(ProcDiedEvent { pid });

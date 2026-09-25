@@ -71,6 +71,7 @@ pub struct RuntimeConfig {
     pub fg_lru_max_depth: usize,
     pub screen_off_harvest: bool,
     pub max_kills_per_pass: usize,
+    pub min_oom_score_adj: i32,
 }
 
 impl Default for RuntimeConfig {
@@ -82,6 +83,7 @@ impl Default for RuntimeConfig {
             fg_lru_max_depth: 10,
             screen_off_harvest: true,
             max_kills_per_pass: 2,
+            min_oom_score_adj: 900,
         }
     }
 }
@@ -129,19 +131,26 @@ impl RuntimeConfig {
                             self.max_kills_per_pass = num.max(1);
                         }
                     }
+                    "min_oom_score_adj" => {
+                        if let Ok(num) = val.parse::<i32>() {
+                            self.min_oom_score_adj = num.clamp(500, 900);
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
 
-    pub fn load_from_file(&mut self, path: &str) {
+    pub fn load_from_file(&mut self, path: &str, quiet: bool) {
         if let Ok(text) = std::fs::read_to_string(path) {
             self.parse_str(&text);
-            println!(
-                "[CONFIG] Active: t_idle={}s, lru_depth={}, mem_crit={}%, fg_lru_max={}, screen_off_harvest={}, max_kills_per_pass={}",
-                self.t_idle_sec, self.lru_protect_depth, self.mem_critical_percent, self.fg_lru_max_depth, self.screen_off_harvest, self.max_kills_per_pass
-            );
+            if !quiet {
+                println!(
+                    "[CONFIG] Active: t_idle={}s, lru_depth={}, mem_crit={}%, fg_lru_max={}, screen_off_harvest={}, max_kills_per_pass={}, min_oom_adj={}",
+                    self.t_idle_sec, self.lru_protect_depth, self.mem_critical_percent, self.fg_lru_max_depth, self.screen_off_harvest, self.max_kills_per_pass, self.min_oom_score_adj
+                );
+            }
         }
     }
 }
@@ -175,6 +184,7 @@ mod tests {
         assert_eq!(cfg.fg_lru_max_depth, 10);
         assert!(cfg.screen_off_harvest);
         assert_eq!(cfg.max_kills_per_pass, 2);
+        assert_eq!(cfg.min_oom_score_adj, 900);
 
         let content = "
             # /data/local/tmp/mlmk/config/daemon.conf
@@ -185,6 +195,7 @@ mod tests {
             fg_lru_max_depth = 20
             screen_off_harvest = false
             max_kills_per_pass = 4
+            min_oom_score_adj = 700
             # Unknown keys should be safely ignored
             invalid_key = 999
         ";
@@ -195,10 +206,17 @@ mod tests {
         assert_eq!(cfg.fg_lru_max_depth, 20);
         assert!(!cfg.screen_off_harvest);
         assert_eq!(cfg.max_kills_per_pass, 4);
+        assert_eq!(cfg.min_oom_score_adj, 700);
 
-        // Enforce lower bound of 1
+        // Enforce lower bound of 1 for max_kills_per_pass
         cfg.parse_str("max_kills_per_pass = 0");
         assert_eq!(cfg.max_kills_per_pass, 1);
+
+        // Clamp min_oom_score_adj to 500..=900
+        cfg.parse_str("min_oom_score_adj = 300");
+        assert_eq!(cfg.min_oom_score_adj, 500);
+        cfg.parse_str("min_oom_score_adj = 1000");
+        assert_eq!(cfg.min_oom_score_adj, 900);
     }
 
     #[test]

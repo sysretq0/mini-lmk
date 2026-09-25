@@ -19,18 +19,47 @@ use std::fs::{self, File, OpenOptions};
 
 use std::io::{BufWriter, Write};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormattedTime([u8; 12]);
+
+impl std::ops::Deref for FormattedTime {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+impl std::fmt::Display for FormattedTime {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self)
+    }
+}
+
 #[inline(always)]
-pub fn format_time_hms_ms(epoch_ms: u64) -> String {
+pub fn format_time_hms_ms(epoch_ms: u64) -> FormattedTime {
     let secs = (epoch_ms / 1000) as libc::time_t;
     let millis = epoch_ms % 1000;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
         libc::localtime_r(&secs, &mut tm);
     }
-    format!(
-        "{:02}:{:02}:{:02}.{:03}",
-        tm.tm_hour, tm.tm_min, tm.tm_sec, millis
-    )
+    let mut buf = [0u8; 12];
+    buf[0] = b'0' + (tm.tm_hour / 10) as u8;
+    buf[1] = b'0' + (tm.tm_hour % 10) as u8;
+    buf[2] = b':';
+    buf[3] = b'0' + (tm.tm_min / 10) as u8;
+    buf[4] = b'0' + (tm.tm_min % 10) as u8;
+    buf[5] = b':';
+    buf[6] = b'0' + (tm.tm_sec / 10) as u8;
+    buf[7] = b'0' + (tm.tm_sec % 10) as u8;
+    buf[8] = b'.';
+    buf[9] = b'0' + ((millis / 100) % 10) as u8;
+    buf[10] = b'0' + ((millis / 10) % 10) as u8;
+    buf[11] = b'0' + (millis % 10) as u8;
+    FormattedTime(buf)
 }
 
 /// Zero-allocation JSON string escaper. Returns Cow::Borrowed if no escaping is needed.
@@ -133,6 +162,7 @@ impl TelemetrySink {
         if let Some(ref mut w) = self.writer {
             if writeln!(w, "{}", line).is_ok() {
                 self.bytes_written += line_len;
+                let _ = w.flush();
             }
         }
     }

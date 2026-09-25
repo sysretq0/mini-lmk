@@ -1,6 +1,6 @@
 # Architecture Specification & Technical Reference: mini-lmk
 
-mini-lmk is a rootless, 100% single-threaded, event-driven memory management daemon operating under Android shell privileges (UID 2000, API 29–37+). It preempts kernel memory thrashing and native lmkd direct-reclaim stalls by tracking application idle durations via native system log events, evicting stale background applications cleanly through Android framework APIs.
+mini-lmk is a rootless, single-threaded, event-driven memory management daemon operating under Android shell privileges (UID 2000, API 29–37+). It preempts kernel memory thrashing and native lmkd direct-reclaim stalls by tracking application idle durations via native system log events, evicting stale background applications cleanly through Android framework APIs.
 
 ---
 
@@ -10,12 +10,12 @@ mini-lmk is a rootless, 100% single-threaded, event-driven memory management dae
 
 * **Identity:** UID `2000` (`shell`), GID `2000` (`shell`), supplementary GID `1007` (`log`). Rootless execution relying on platform shell privileges (accessible via ADB or Shizuku).
 * **SELinux Domain:** `u:r:shell:s0` (Stock enforcing domain; zero root, KernelSU, Magisk, or custom sepolicy modifications required).
-* **Single-Threaded & Fail-Fast:** Operates strictly on a single thread. It maintains no complex in-process reconnection state machines: if the logcat stream closes, yields `EPOLLHUP`, or encounters unrecoverable read errors, the daemon exits immediately (`exit(1)`). Process supervision and restarts are delegated externally to an init service or shell supervisor loop.
+* **Single-Threaded & Fail-Fast:** Operates strictly on a single thread. It maintains no in-process reconnection state machine: if the logcat stream closes, yields `EPOLLHUP`, or encounters unrecoverable read errors, the daemon exits immediately (`exit(1)`). Process supervision and restarts are delegated externally to an init service or shell supervisor loop.
 * **Footprint:** Single native binary compiled for `aarch64-linux-android` against Bionic `libc` (< 400 KB stripped ELF; < 4 MB RSS operational footprint).
 
 ### 1.2 Minimal 2-FD Epoll Reactor
 
-The daemon runs a pure push-based event loop with zero polling wakeups. The execution thread sleeps inside the kernel via `epoll_wait()`, consuming **0.0% CPU** during idle intervals across exactly **two file descriptors**:
+The daemon runs a push-based event loop with zero polling wakeups. The execution thread sleeps inside the kernel via `epoll_wait()`, consuming **0.0% CPU** during idle intervals across exactly **two file descriptors**:
 
 ```
 +------------------------------------------------------------------------+
@@ -33,7 +33,7 @@ The daemon runs a pure push-based event loop with zero polling wakeups. The exec
 | Token | Descriptor Type | Source / Path | Trigger Condition | Reactor Action |
 |---|---|---|---|---|
 | `TOKEN_LOGCAT_PIPE` | Non-blocking Pipe (`O_NONBLOCK`) | Output of child `logcat` | Log buffer write | Parse event tag; update in-memory lifecycle state; evaluate reaping gates. Exits process on EOF/HUP. |
-| `TOKEN_INOTIFY` | Linux inotify | Watch on `<base>/config/` (`CLOSE_WRITE` \| `MOVED_TO` \| `CREATE` \| `DELETE`) | Config modified | Instantly reloads `daemon.conf`, `exclude.list`, and `games.list` in memory without dropping state. |
+| `TOKEN_INOTIFY` | Linux inotify | Watch on `<base>/config/` (`CLOSE_WRITE` \| `MOVED_TO` \| `CREATE` \| `DELETE`) | Config modified | Reloads `daemon.conf`, `exclude.list`, and `games.list` in memory without dropping state. |
 
 ### 1.3 Unified Native Event Stream
 
@@ -60,7 +60,7 @@ logcat -b events -v tag -s wm_resume_activity am_resume_activity am_proc_start a
     * If foreground activity launch: defers evaluation to `wm_resume_activity` so that evictions are masked behind UI transition animations.
     * If background spawn (`!is_fg_launch`): immediately evaluates the reaping pipeline (unconstrained marker architecture). This eliminates the single-app inactivity deadlock during prolonged foreground sessions while avoiding continuous timers or polling.
 
-* **`am_proc_died` (Process Eviction & Pure State Cleanup):**
+* **`am_proc_died` (Process Eviction & State Cleanup):**
   * *Payload:* `[<user_id>, <pid>, <process_name>, <oom_adj>, <reason>]`
   * *Action:* Drops the PID and package from memory tables (`pid_to_pkg`, `record.pids`) and increments background death counters. It strictly avoids invoking `evaluate_reaping_pipeline()`—process deaths return physical RAM to the kernel, so triggering evictions on process death would induce artificial eviction cascades.
 
@@ -74,7 +74,7 @@ logcat -b events -v tag -s wm_resume_activity am_resume_activity am_proc_start a
 
 ### 1.4 Dynamic Role-Based System Immunity
 
-The daemon discovers system defaults dynamically on startup and config reloads, completely avoiding hardcoded vendor package names:
+The daemon discovers system defaults dynamically on startup and config reloads, avoiding hardcoded vendor package names:
 
 * **Platform Roles (`cmd role get-role-holders <ROLE>`):**
   * `android.app.role.HOME`: Active launcher.
@@ -127,21 +127,21 @@ struct DaemonState {
   * Outgoing package: record `last_active = Instant::now()`.
   * Incoming package: push to head of `fg_lru`. Triggers `evaluate_reaping_pipeline()`.
 * **Process Death (`am_proc_died`):** Resolves PID via `pid_to_pkg`, drops PID from `record.pids`, and increments `session_stats.bg_deaths`. When all PIDs for a package exit, removes the package from `alive_apps`. Does not trigger reaping.
-* **Kill Dispatch (`evaluate_reaping_pipeline`):** Once `cmd activity kill` is dispatched for candidate `cand.pkg`, immediately purges `cand.pkg` from `alive_apps` to prevent duplicate kills across rapid back-to-back evaluations. Intentionally retains `pid_to_pkg` mappings until asynchronous `am_proc_died` arrives to ensure 100% accurate death telemetry.
+* **Kill Dispatch (`evaluate_reaping_pipeline`):** Once `cmd activity kill` is dispatched for candidate `cand.pkg`, immediately purges `cand.pkg` from `alive_apps` to prevent duplicate kills across rapid back-to-back evaluations. Retains `pid_to_pkg` mappings until asynchronous `am_proc_died` arrives to record death telemetry when processes terminate.
 
 ### 2.1 Lazy / Opportunistic PID Retaining
 
 A critical design trade-off in `mini-lmk` is the **deliberate deferral of PID liveliness checks for protected applications**:
-* **Why Non-Candidates Are Not Probed:** In any running Android system, dozens of apps reside in protected states (LRU position `< depth`, or idle time `< T_idle`). Actively polling or probing `/proc/<pid>/statm` for all tracked PIDs on every event would continuously wake CPU cores, thrash VFS caches, and disrupt low-power C-states—violating `mini-lmk`'s zero-overhead guarantee.
+* **Why Non-Candidates Are Not Probed:** In any running Android system, dozens of apps reside in protected states (LRU position `< depth`, or idle time `< T_idle`). Actively polling or probing `/proc/<pid>/statm` for all tracked PIDs on every event would continuously wake CPU cores, thrash VFS caches, and disrupt low-power C-states—violating `mini-lmk`'s zero-overhead design target.
 * **Event-Driven Eager Cleanup:** Under normal execution, the logcat stream delivers `am_proc_died` events synchronously whenever processes exit, naturally unmapping PIDs and removing dead apps.
-* **Opportunistic Candidate Reconciliation:** If an unmonitored or silent exit occurs, the PID is retained lazily in memory at zero cost until the enclosing package ages out of protection and qualifies as an eviction candidate. During candidate evaluation, targeted `/proc/<pid>/statm` probes verify PID existence. Dead PIDs and departed packages discovered during this probe are instantly purged (`dead_pids`, `dead_pkgs`, `record.pids.retain(...)`).
-* **Guarantee:** Candidate ranking and RSS reclamation calculations are strictly based on verified alive PIDs, with 0% steady-state CPU overhead.
+* **Opportunistic Candidate Reconciliation:** If an unmonitored or silent exit occurs, the PID is retained lazily in memory at zero cost until the enclosing package ages out of protection and qualifies as an eviction candidate. During candidate evaluation, targeted `/proc/<pid>/statm` probes verify PID existence. Dead PIDs and departed packages discovered during this probe are purged (`dead_pids`, `dead_pkgs`, `record.pids.retain(...)`).
+* **Candidate Verification:** Candidate ranking and RSS reclamation calculations evaluate only verified alive PIDs without continuous `/proc` polling.
 
 ### 2.2 Trampoline & Ephemeral Activity Filtering
 
 To protect user multi-tasking state against activity re-entrance and auth overlays (e.g. Google Sign-In `SignInHubActivity`, intent choosers, payment gateways, ad SDK trampolines):
 * **Transient Session Detection:** When an app departs the foreground after `< 500 ms` (`prev_dur_ms < 500`), it is classified as a transient trampoline rather than an intentional user application session.
-* **LRU De-pollution:** The transient package is immediately pruned from `fg_lru`. This prevents rapid flash activities from displacing genuine user applications from the LRU protection window (`< lru_protect_depth`), preserving user app state across auth redirects and deep links.
+* **LRU De-pollution:** The transient package is immediately pruned from `fg_lru`. This prevents rapid flash activities from displacing user applications from the LRU protection window (`< lru_protect_depth`), preserving user app state across auth redirects and deep links.
 
 ---
 
@@ -171,6 +171,7 @@ Reap Evaluation Triggers:
           ├── [Check 1] In static/dynamic exclusions? ────────► SKIP (Protected Role / Exclude)
           ├── [Check 2] Position in fg_lru < effective_lru? ──► SKIP (Active App Protection)
           ├── [Check 3] (Instant::now() - last_active) < T_idle? ► SKIP (Young / Warm App)
+          ├── [Check 4] min(oom_score_adj) < min_oom_score_adj? ─► SKIP (Active / Service Process)
           │
           ▼
       [Eviction Candidates Identified]
@@ -180,7 +181,7 @@ Reap Evaluation Triggers:
           └── Execute: cmd activity kill --user all <pkg>
 ```
 
-### 3.1 Dual-Gate Rules
+### 3.1 Multi-Gate Rules
 
 1. **Recency Protection Gate (`effective_lru_depth`):**
    * **Screen ON (or `screen_off_harvest=false`):** The last N packages visited in `fg_lru` (default: 3) are completely protected. This prevents closing apps during active switching loops (such as copying 2FA verification codes).
@@ -193,6 +194,13 @@ Reap Evaluation Triggers:
    * Background-spawned processes (`am_proc_start`) begin their clock at spawn and qualify only after crossing `T_idle_effective`.
    * Stale unindexed processes default to `t_idle = ∞` and qualify immediately if beyond `effective_lru_depth`.
 
+3. **OOM Score Qualification Gate (`min_oom_score_adj`):**
+   * The daemon queries `/proc/<pid>/oom_score_adj` for every live PID belonging to the candidate package.
+   * If `min(oom_score_adj) < min_oom_score_adj`, the entire package is shielded and skipped.
+   * Tunable in `daemon.conf` between `500` and `900` (default: `900`):
+     * `900` (Conservative): Restricts evictions strictly to cached/idle processes (`CACHED_APP_MIN_ADJ = 900`). shielding processes with `oom_score_adj < 900` (e.g., active background services, audio players, background downloads).
+     * `500` (Aggressive): Permits eviction of background services down to AOSP's framework limit (`SERVICE_ADJ = 500`). Maximizes reclaimable RAM for gaming or constrained devices.
+
 ### 3.2 Escalation Modes
 
 * **Game Focus Entry:** If the incoming package matches `games.list`, `T_idle` drops to `0`. All non-excluded background apps beyond `effective_lru_depth` are evicted immediately to maximize physical RAM before the game engine allocates its heap.
@@ -203,7 +211,7 @@ Reap Evaluation Triggers:
 
 When multiple candidate packages qualify for eviction simultaneously:
 
-1. The daemon reads column 2 (resident pages × `PAGE_SIZE`) from `/proc/<pid>/statm` **strictly for the qualified candidates**. Any PIDs returning 0 RSS (`ENOENT` caused by process exit missed during rare logcat ring buffer drops) are opportunistically purged from `pid_to_pkg` and `record.pids`. If all PIDs for a candidate have exited, the stale package entry is deleted from `alive_apps`—achieving self-healing state reconciliation with zero periodic `/proc` filesystem sweeps.
+1. The daemon reads column 2 (resident pages × `PAGE_SIZE`) from `/proc/<pid>/statm` **strictly for the qualified candidates**. Any PIDs returning 0 RSS (`ENOENT` caused by process exit missed during rare logcat ring buffer drops) are opportunistically purged from `pid_to_pkg` and `record.pids`. If all PIDs for a candidate have exited, the stale package entry is deleted from `alive_apps`—reconciling in-memory state without periodic `/proc` filesystem sweeps.
 2. Surviving candidates are sorted in **descending order of RSS** (reclaiming the largest memory footprints first).
 3. **Hardware-Scaled Burst Limit (`max_kills_per_pass`):** Only the top N candidates are evicted in a single pass to bound reactor latency and prevent Binder thread contention in `system_server`. Defaults auto-scale by physical RAM detected from `/proc/meminfo` at startup:
    * **<= 4.5 GB RAM:** 4 kills per pass (aggressive recovery on low-RAM devices).
@@ -225,6 +233,7 @@ The following parameters in `daemon.conf` are live-calibrated via inotify. Their
 | `fg_lru_max_depth` | `10` packages | Maximum depth of the foreground history ring buffer. |
 | `screen_off_harvest` | `true` | Enables opportunistic screen-off maintenance during Doze heartbeats (`device_idle_light_step`). |
 | `max_kills_per_pass` | Auto-scaled (`1`–`4`) | Maximum candidate packages evicted per pass (burst cap). Auto-scales by physical RAM: `<=4.5 GB` -> 4, `4.5–8.5 GB` -> 2, `>8.5 GB` -> 1. |
+| `min_oom_score_adj` | `900` (`500`–`900`) | Minimum OOM score required for eviction eligibility. Clamped to `500..=900`. `900` targets cached/idle processes; `500` extends reclamation to background services. |
 
 ---
 
@@ -259,6 +268,11 @@ screen_off_harvest=true
 # Maximum background apps evicted per reap pass (burst cap)
 # Defaults auto-scale by physical RAM: <=4.5GB -> 4, 4.5GB-8.5GB -> 2, >8.5GB -> 1
 # max_kills_per_pass=2
+
+# Minimum oom_score_adj threshold required for eviction (range: 500-900, default: 900)
+# 900: Conservative (cached & idle processes only; protects all background services)
+# 500: Aggressive (matches AOSP SERVICE_ADJ; reclaims background services for games/heavy loads)
+min_oom_score_adj=900
 ```
 
 #### Exclusions (`config/exclude.list`)

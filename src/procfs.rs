@@ -53,6 +53,33 @@ pub fn read_statm_rss_kb(pid: u32, page_size_kb: u64) -> u64 {
         .unwrap_or(0)
 }
 
+/// Reads /proc/<pid>/oom_score_adj.
+pub fn read_oom_score_adj(pid: u32) -> Option<i32> {
+    let mut path_buf = [0u8; 32];
+    format_proc_path(&mut path_buf, pid, "oom_score_adj");
+
+    let fd = unsafe {
+        libc::open(path_buf.as_ptr() as *const libc::c_char, libc::O_RDONLY | libc::O_CLOEXEC)
+    };
+    if fd < 0 {
+        return None;
+    }
+
+    let mut buf = [0u8; 16];
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    unsafe { libc::close(fd); }
+
+    if n <= 0 {
+        return None;
+    }
+
+    std::str::from_utf8(&buf[..n as usize])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Reads MemTotal and MemAvailable from /proc/meminfo in kilobytes.
 pub fn read_meminfo_kb() -> (u64, u64) {
     let fd = unsafe {
@@ -142,5 +169,12 @@ mod tests {
         assert_eq!(dirty[31], 0);
         let path3 = std::ffi::CStr::from_bytes_until_nul(&dirty).unwrap();
         assert!(path3.to_str().unwrap().starts_with("/proc/99999/"));
+    }
+
+    #[test]
+    fn test_read_oom_score_adj() {
+        let pid = std::process::id();
+        let adj = read_oom_score_adj(pid);
+        assert!(adj.is_some());
     }
 }

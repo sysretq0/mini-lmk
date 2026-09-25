@@ -2,7 +2,7 @@
 
 An event-driven userspace memory manager for Android 10+ (API 29–37+) running under Android shell privileges (UID 2000, non-root).
 
-`mini-lmk` preempts kernel direct-reclaim thrashing and native `lmkd` stalls by proactively evicting stale background applications during natural foreground transition animations and background spawn events. Operating strictly via a single-threaded 2-file-descriptor `epoll` reactor, it maintains an operational footprint of **~1.12 MB PSS** with **0% idle CPU utilization**.
+`mini-lmk` preempts kernel direct-reclaim thrashing and native `lmkd` stalls by proactively evicting stale background applications during foreground transition animations and background spawn events. Operating strictly via a single-threaded 2-file-descriptor `epoll` reactor, it maintains an operational footprint of **~1.12 MB PSS** with **0% idle CPU utilization**.
 
 ---
 
@@ -11,10 +11,10 @@ An event-driven userspace memory manager for Android 10+ (API 29–37+) running 
 * **Rootless / Shell-Privileged:** Operates under standard Android shell permissions (UID `2000`, `u:r:shell:s0` via ADB or Shizuku). Requires zero root, KernelSU, Magisk, or custom SELinux modifications while retaining access to the framework's `cmd activity` IPC interface and `logcat` event buffers.
 * **Zero-Allocation Hot Paths:** Parses binary logcat event streams and `/proc` metrics using stack-allocated buffers and zero-copy byte slicing. Zero heap allocations during steady-state reactor operations.
 * **Animation-Masked Eviction:** Reaping evaluations triggered by application switching (`wm_resume_activity` / `am_resume_activity`) mask framework kill latency behind native 200–300 ms window transition animations.
-* **Unconstrained Marker Architecture:** Intercepts background process creation (`am_proc_start`) while ignoring foreground task launches, resolving single-app inactivity deadlocks during extended stationary sessions without synthetic polling timers.
+* **Background Spawn Triggering:** Intercepts background process creation (`am_proc_start`) while ignoring foreground task launches, resolving single-app inactivity deadlocks during extended stationary sessions without synthetic polling timers.
 * **Non-Blocking Asynchronous Reaping:** Dispatches `cmd activity kill --user all <pkg>` asynchronously via `posix_spawn` with non-blocking child harvesting (`libc::waitpid(-1, ..., WNOHANG)`), keeping UI render thread latency flat.
 * **External Process Supervision:** Follows fail-fast systems design. If the upstream logcat pipe yields `EOF` or `EPOLLHUP`, the daemon exits immediately and cleanly, delegating process resurrection to an external supervisor loop (`run-daemon.sh`).
-* **Hardware-Scaled Burst Limits:** Automatically tunes eviction burst limits (`max_kills_per_pass`) to physical RAM detected at startup, protecting system_server Binder IPC queues from saturation.
+* **Hardware-Scaled Burst Limits:** Sets eviction burst limits (`max_kills_per_pass`) to physical RAM detected at startup, protecting system_server Binder IPC queues from saturation.
 * **Bounded Disk Footprint:** Dual-output telemetry sink maintains an aligned human-readable terminal table alongside structured NDJSON operations logging with automatic 512 KB log rotation.
 
 ---
@@ -54,7 +54,7 @@ Sort Candidates Descending by RSS (/proc/<pid>/statm)
 Dispatch: cmd activity kill --user all <pkg>
     │
     ├── Immediately evicts package from alive_apps (prevents duplicate kills)
-    └── Retains pid_to_pkg mappings (guarantees accurate am_proc_died telemetry)
+    └── Retains pid_to_pkg mappings (enables attributing am_proc_died telemetry)
 ```
 
 ---
@@ -71,7 +71,7 @@ mini-lmk/
 ├── package.sh               # Multi-ABI AxManager plugin packaging script
 ├── run-daemon.sh            # Target hardware supervisor loop
 ├── docs/
-│   └── ARCHITECTURE.md      # Complete architectural specification & reference
+│   └── ARCHITECTURE.md      # Architectural specification & reference
 ├── package/
 │   └── axmanager/           # AxManager / Axeron module configuration and scripts
 └── src/
@@ -87,7 +87,7 @@ mini-lmk/
 
 ## Configuration
 
-Configuration files reside under `<base>/config/` (dynamically resolved to `$MODPATH/mlmk/config/` in AxManager, or `/data/local/tmp/mlmk/config/` for standalone ADB execution) and are automatically hot-reloaded via `inotify` when modified:
+Configuration files reside under `<base>/config/` (dynamically resolved to `$MODPATH/mlmk/config/` in AxManager, or `/data/local/tmp/mlmk/config/` for standalone ADB execution) and are reloaded via `inotify` when modified:
 
 ### `daemon.conf`
 
@@ -112,7 +112,22 @@ screen_off_harvest=true
 # Maximum background apps evicted per reap pass (burst cap)
 # Defaults auto-scale by physical RAM: <=4.5GB -> 4, 4.5GB-8.5GB -> 2, >8.5GB -> 1
 # max_kills_per_pass=2
+
+# Minimum oom_score_adj threshold required for eviction (range: 500-900, default: 900)
+# 900: Conservative (cached & idle processes only; protects all background services)
+# 500: Aggressive (matches AOSP SERVICE_ADJ; reclaims background services for games/heavy loads)
+min_oom_score_adj=900
 ```
+
+| Parameter | Default | Range / Scale | Description |
+|---|---|---|---|
+| `t_idle_sec` | `180` | `u64` (seconds) | Background idle age before qualifying for eviction. |
+| `lru_protect_depth` | `3` | `usize` | Number of most recently used foreground apps shielded from eviction. |
+| `mem_critical_percent` | `10` | `u64` (%) | RAM watermark triggering emergency idle bypass (`T_idle = 0s`). |
+| `fg_lru_max_depth` | `10` | `usize` | Maximum size of the foreground LRU ring buffer. |
+| `screen_off_harvest` | `true` | `bool` | Accelerates idle decay and narrows LRU depth to 1 during screen-off Doze cycles. |
+| `max_kills_per_pass` | `2` (auto-scaled) | `1`–`4` | Eviction burst cap. Scaled by RAM: `<=4.5GB` -> 4, `4.5-8.5GB` -> 2, `>8.5GB` -> 1. |
+| `min_oom_score_adj` | `900` | `500`–`900` | Minimum OOM score required for eviction. `900` protects services; `500` reclaims background services. |
 
 ### `exclude.list`
 
@@ -181,7 +196,7 @@ adb shell "nohup /data/local/tmp/mlmk/run-daemon.sh --act > /data/local/tmp/mlmk
 
 | Flag | Description |
 |---|---|
-| `--observe` | Run in observation mode (emits telemetry and simulates candidate kills; default). |
+| `--observe` | Run in observation mode (emits telemetry and simulates candidate kills). |
 | `--act` | Run in active enforcement mode (`cmd activity kill --user all <pkg>`). |
 | `--json` | Output raw NDJSON directly to stdout instead of the formatted columnar table. |
 | `-h`, `--help` | Display usage and help message. |
@@ -202,7 +217,7 @@ Live operations are formatted into aligned columns on standard output:
 14:25:40.201   BG_SUMMARY   --                         interval=144s  spawns=5  deaths=4  rss_delta=+12MB
 ```
 
-All operations are simultaneously written to `<base>/logs/operations.log` in NDJSON format, automatically rotating to `operations.log.old` upon exceeding 512 KB.
+All operations are simultaneously written to `<base>/logs/operations.log` in NDJSON format, rotating to `operations.log.old` upon exceeding 512 KB.
 
 ---
 

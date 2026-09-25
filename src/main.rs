@@ -24,7 +24,7 @@ mod telemetry;
 use config::{ConfigPaths, RuntimeConfig};
 use hasher::{FastMap, FastSet};
 use parser::{parse_logcat_line, LogcatEvent, ProcDiedEvent, ProcStartEvent, ResumeActivityEvent};
-use procfs::{check_mem_critical, read_statm_rss_kb, read_total_ram_mb};
+use procfs::{check_mem_critical, read_oom_score_adj, read_statm_rss_kb, read_total_ram_mb};
 use telemetry::{escape_json, format_time_hms_ms, SessionStats, TelemetrySink};
 
 use std::collections::VecDeque;
@@ -47,7 +47,6 @@ const TOKEN_INOTIFY: u64 = 2;
 
 #[derive(Debug)]
 struct AppRecord {
-    pids: FastSet<u32>,
     last_active: Instant,
 }
 
@@ -61,9 +60,13 @@ struct Candidate {
 
 struct DaemonState {
     config: RuntimeConfig,
+    json_stdout: bool,
 
     alive_apps: FastMap<String, AppRecord>,
     pid_to_pkg: FastMap<u32, String>,
+    pkg_to_pids: FastMap<String, FastSet<u32>>,
+    pkg_to_uid: FastMap<String, u32>,
+    recent_deaths: FastMap<String, Instant>,
     user_exclusions: FastSet<String>,
     games: FastSet<String>,
     dynamic_exclusions: FastSet<String>,
@@ -147,7 +150,9 @@ impl DaemonState {
         let screen_on = detect_initial_screen_on();
         let screen_on_start = if screen_on { Some(now) } else { None };
         let screen_off_start = if !screen_on { Some(now) } else { None };
-        println!("[DAEMON] Initial display state: screen_on={}", screen_on);
+        if !json_stdout {
+            println!("[DAEMON] Initial display state: screen_on={}", screen_on);
+        }
 
         let total_ram_mb = read_total_ram_mb();
         let detected_default_kills = if total_ram_mb <= 4608 {
@@ -157,10 +162,12 @@ impl DaemonState {
         } else {
             1 // > 8.5GB RAM devices (12GB+ configurations)
         };
-        println!(
-            "[DAEMON] Hardware profile: total_ram={}MB (default max_kills={})",
-            total_ram_mb, detected_default_kills
-        );
+        if !json_stdout {
+            println!(
+                "[DAEMON] Hardware profile: total_ram={}MB (default max_kills={})",
+                total_ram_mb, detected_default_kills
+            );
+        }
 
         let mut config = RuntimeConfig::default();
         config.max_kills_per_pass = detected_default_kills;
@@ -176,6 +183,9 @@ impl DaemonState {
             dynamic_exclusions: FastSet::default(),
             alive_apps: FastMap::default(),
             pid_to_pkg: FastMap::default(),
+            pkg_to_pids: FastMap::default(),
+            pkg_to_uid: FastMap::default(),
+            recent_deaths: FastMap::default(),
             fg_lru: VecDeque::with_capacity(16),
             current_fg: None,
             screen_on,
@@ -186,6 +196,7 @@ impl DaemonState {
             game_intrusion_count: 0,
             act_mode,
             telemetry,
+            json_stdout,
             session_start: now,
             session_stats: SessionStats::default(),
             page_size_kb,
@@ -226,8 +237,9 @@ impl DaemonState {
     }
 
     fn seed_initial_state(&mut self) {
-        println!("[DAEMON] Performing cold-start discovery...");
-        let now = Instant::now();
+        if !self.json_stdout {
+            println!("[DAEMON] Performing cold-start discovery...");
+        }
         let entries = match fs::read_dir("/proc") {
             Ok(e) => e,
             Err(_) => return,
@@ -245,9 +257,7 @@ impl DaemonState {
                 Err(_) => continue,
             };
 
-            if meta.uid() < 10000 {
-                continue;
-            }
+            let uid = meta.uid();
 
             let bytes = match fs::read(path.join("cmdline")) {
                 Ok(b) if !b.is_empty() => b,
@@ -261,17 +271,21 @@ impl DaemonState {
                     let pkg = raw_proc.split(':').next().unwrap_or(raw_proc).trim().to_string();
                     if !pkg.starts_with('-') {
                         self.pid_to_pkg.insert(pid, pkg.clone());
-
-                        let app = self.alive_apps.entry(pkg).or_insert_with(|| AppRecord {
-                            pids: FastSet::default(),
-                            last_active: now,
-                        });
-                        app.pids.insert(pid);
+                        self.pkg_to_pids.entry(pkg.clone()).or_default().insert(pid);
+                        self.pkg_to_uid.insert(pkg, uid);
+                        // alive_apps is deliberately NOT populated here.
+                        // Cold-start processes must not be artificially aged into eviction candidates.
                     }
                 }
             }
         }
-        println!("[DAEMON] Indexed {} active app packages.", self.alive_apps.len());
+        if !self.json_stdout {
+            println!(
+                "[DAEMON] Indexed {} active PIDs across {} packages.",
+                self.pid_to_pkg.len(),
+                self.pkg_to_pids.len()
+            );
+        }
     }
 
     fn ensure_inotify_watch(&mut self) {
@@ -290,7 +304,7 @@ impl DaemonState {
         }
     }
 
-    fn load_file_lines(path: &str, set: &mut FastSet<String>) {
+    fn load_file_lines(path: &str, set: &mut FastSet<String>, json_stdout: bool) {
         set.clear();
         if let Ok(content) = fs::read_to_string(path) {
             for line in content.lines() {
@@ -299,16 +313,18 @@ impl DaemonState {
                     set.insert(trimmed.to_string());
                 }
             }
-            println!("[CONFIG] Loaded {} entries from {}", set.len(), path);
+            if !json_stdout {
+                println!("[CONFIG] Loaded {} entries from {}", set.len(), path);
+            }
         }
     }
 
     fn reload_configs(&mut self) {
         let prev_cfg = self.config;
         let paths = ConfigPaths::get();
-        self.config.load_from_file(&paths.config_file);
-        Self::load_file_lines(&paths.exclude_file, &mut self.user_exclusions);
-        Self::load_file_lines(&paths.games_file, &mut self.games);
+        self.config.load_from_file(&paths.config_file, self.json_stdout);
+        Self::load_file_lines(&paths.exclude_file, &mut self.user_exclusions, self.json_stdout);
+        Self::load_file_lines(&paths.games_file, &mut self.games, self.json_stdout);
 
         if self.config != prev_cfg {
             let now_epoch = Self::get_epoch_ms();
@@ -354,7 +370,9 @@ impl DaemonState {
                             && !pkg.starts_with("Error")
                             && !pkg.starts_with('-')
                         {
-                            println!("[SYSTEM] Detected {}: {}", label, pkg);
+                            if !self.json_stdout {
+                                println!("[SYSTEM] Detected {}: {}", label, pkg);
+                            }
                             self.dynamic_exclusions.insert(pkg.to_string());
                         }
                     }
@@ -379,7 +397,9 @@ impl DaemonState {
                         } else { s };
                         let pkg = unpeeled.split('/').next().unwrap_or(unpeeled).trim();
                         if !pkg.is_empty() && pkg.contains('.') && !pkg.contains(' ') && !pkg.starts_with('-') {
-                            println!("[SYSTEM] Detected {}: {}", label, pkg);
+                            if !self.json_stdout {
+                                println!("[SYSTEM] Detected {}: {}", label, pkg);
+                            }
                             self.dynamic_exclusions.insert(pkg.to_string());
                         }
                     }
@@ -389,7 +409,9 @@ impl DaemonState {
     }
 
     fn spawn_logcat_stream(&mut self) {
-        println!("[DAEMON] Spawning unified logcat stream...");
+        if !self.json_stdout {
+            println!("[DAEMON] Spawning unified logcat stream...");
+        }
         let mut child = match Command::new("/system/bin/logcat")
             .args([
                 "-b", "events",
@@ -426,7 +448,9 @@ impl DaemonState {
 
         self.logcat_fd = raw_fd;
         self.logcat_child = Some(child);
-        println!("[DAEMON] Logcat stream active on fd={}", self.logcat_fd);
+        if !self.json_stdout {
+            println!("[DAEMON] Logcat stream active on fd={}", self.logcat_fd);
+        }
     }
 
     #[inline(always)]
@@ -452,41 +476,45 @@ impl DaemonState {
         let now_epoch = Self::get_epoch_ms();
         let mut prev_dur_ms = 0u64;
 
-        let prev_pkg_opt = self.current_fg.clone();
+        let prev_pkg_opt = self.current_fg.take();
         if let Some(ref prev_pkg) = prev_pkg_opt {
             if prev_pkg != pkg {
-                if let Some(rec) = self.alive_apps.get_mut(prev_pkg) {
-                    prev_dur_ms = now.duration_since(rec.last_active).as_millis() as u64;
-                    rec.last_active = now;
-                } else {
-                    self.alive_apps.insert(prev_pkg.clone(), AppRecord {
-                        pids: FastSet::default(),
-                        last_active: now,
-                    });
+                // Guard: Only user/app packages with verified UID >= 10000 may enter alive_apps.
+                // Fail-closed: If UID cannot be resolved, assume protected/system and DO NOT insert.
+                if self.pkg_to_uid.get(prev_pkg).map_or(false, |&uid| uid >= 10000) {
+                    if let Some(rec) = self.alive_apps.get_mut(prev_pkg) {
+                        prev_dur_ms = now.duration_since(rec.last_active).as_millis() as u64;
+                        rec.last_active = now;
+                    } else {
+                        self.alive_apps.insert(prev_pkg.clone(), AppRecord {
+                            last_active: now,
+                        });
+                    }
                 }
             }
         }
 
-        // Emit background summary accumulated during previous foreground window
         let interval_sec = now.duration_since(self.session_start).as_secs();
         self.emit_bg_summary(now_epoch, interval_sec);
 
         // If the departed package was only in foreground for < 500ms (e.g. trampoline, chooser, auth pulse),
         // evict it from fg_lru so it does not displace real user applications in the LRU protection window.
         if prev_dur_ms > 0 && prev_dur_ms < 500 {
-            if let Some(ref prev) = prev_pkg_opt {
-                if let Some(pos) = self.fg_lru.iter().position(|x| x == prev) {
-                    self.fg_lru.remove(pos);
-                }
+            if let Some(pos) = self.fg_lru.iter().position(|x| x == prev_pkg_opt.as_deref().unwrap()) {
+                self.fg_lru.remove(pos);
             }
         }
 
         if let Some(pos) = self.fg_lru.iter().position(|x| x == pkg) {
-            self.fg_lru.remove(pos);
-        }
-        self.fg_lru.push_front(pkg.to_string());
-        if self.fg_lru.len() > self.config.fg_lru_max_depth {
-            self.fg_lru.pop_back();
+            if pos > 0 {
+                let existing = self.fg_lru.remove(pos).unwrap();
+                self.fg_lru.push_front(existing);
+            }
+        } else {
+            self.fg_lru.push_front(pkg.to_string());
+            if self.fg_lru.len() > self.config.fg_lru_max_depth {
+                self.fg_lru.pop_back();
+            }
         }
 
         let was_gaming = self.is_gaming;
@@ -523,7 +551,11 @@ impl DaemonState {
             self.game_session_start = None;
         }
 
-        self.current_fg = Some(pkg.to_string());
+        if prev_pkg_opt.as_deref() == Some(pkg) {
+            self.current_fg = prev_pkg_opt.clone();
+        } else {
+            self.current_fg = Some(pkg.to_string());
+        }
 
         let json = format!(
             r#"{{"ts":{},"event":"fg_switch","pkg":"{}","component":"{}","prev_dur_ms":{},"is_game":{}}}"#,
@@ -543,7 +575,9 @@ impl DaemonState {
             &json,
         );
 
-        self.evaluate_reaping_pipeline();
+        if prev_pkg_opt.as_deref() != Some(pkg) {
+            self.evaluate_reaping_pipeline();
+        }
     }
 
     fn on_proc_start(&mut self, ev: &ProcStartEvent) {
@@ -581,19 +615,41 @@ impl DaemonState {
             );
         }
 
-        self.pid_to_pkg.insert(pid, pkg.to_string());
-        self.alive_apps
-            .entry(pkg.to_string())
-            .or_insert_with(|| AppRecord {
-                pids: FastSet::default(),
-                last_active: now,
-            })
-            .pids
-            .insert(pid);
+        let pkg_owned = pkg.to_string();
+        self.pid_to_pkg.insert(pid, pkg_owned.clone());
+        self.pkg_to_pids.entry(pkg_owned.clone()).or_default().insert(pid);
+        if !self.pkg_to_uid.contains_key(pkg) {
+            self.pkg_to_uid.insert(pkg_owned.clone(), uid);
+        }
 
-        let is_fg_launch = is_fg || ev.spawn_type == "top-activity" || ev.spawn_type == "next-top-activity";
-        if !is_fg_launch {
-            self.evaluate_reaping_pipeline();
+        // Respawn tracking (proc_died -> proc_start within 120s)
+        if let Some(death_time) = self.recent_deaths.remove(pkg) {
+            let gap_ms = now.duration_since(death_time).as_millis() as u64;
+            if gap_ms <= 120_000 {
+                let json = format!(
+                    r#"{{"ts":{},"event":"respawn","pkg":"{}","gap_ms":{},"pid":{},"uid":{},"type":"{}"}}"#,
+                    now_epoch, escape_json(pkg), gap_ms, pid, uid, escape_json(spawn_type)
+                );
+                self.telemetry.emit_with(
+                    || {
+                        let time_str = format_time_hms_ms(now_epoch);
+                        let detail = format!("gap={}ms  pid={}  type={}", gap_ms, pid, spawn_type);
+                        format!("{:<12}   {:<12} {:<26} {}", time_str, "RESPAWN", pkg, detail)
+                    },
+                    &json,
+                );
+            }
+        }
+
+        if uid >= 10000 {
+            self.alive_apps
+                .entry(pkg_owned)
+                .or_insert_with(|| AppRecord { last_active: now });
+
+            let is_fg_launch = is_fg || ev.spawn_type == "top-activity" || ev.spawn_type == "next-top-activity";
+            if !is_fg_launch {
+                self.evaluate_reaping_pipeline();
+            }
         }
     }
 
@@ -601,17 +657,22 @@ impl DaemonState {
         let pid = ev.pid;
 
         if let Some(pkg) = self.pid_to_pkg.remove(&pid) {
-            let mut is_empty = false;
-            if let Some(record) = self.alive_apps.get_mut(&pkg) {
-                record.pids.remove(&pid);
-                is_empty = record.pids.is_empty();
-            }
-            if is_empty {
-                self.alive_apps.remove(&pkg);
+            let now = Instant::now();
+
+            if let Some(pids) = self.pkg_to_pids.get_mut(&pkg) {
+                pids.remove(&pid);
+                if pids.is_empty() {
+                    self.alive_apps.remove(&pkg);
+                }
             }
             let is_fg = self.current_fg.as_deref() == Some(&pkg);
             if !is_fg {
                 self.session_stats.bg_deaths += 1;
+            }
+
+            self.recent_deaths.insert(pkg, now);
+            if self.recent_deaths.len() > 64 {
+                self.recent_deaths.retain(|_, death_time| now.duration_since(*death_time) <= Duration::from_secs(120));
             }
         }
     }
@@ -728,13 +789,15 @@ impl DaemonState {
 
             let mut total_rss_kb = 0u64;
             let mut live_pids = Vec::new();
-            for &pid in &record.pids {
-                let rss = read_statm_rss_kb(pid, self.page_size_kb);
-                if rss > 0 {
-                    total_rss_kb += rss;
-                    live_pids.push(pid);
-                } else {
-                    dead_pids.push(pid);
+            if let Some(pids) = self.pkg_to_pids.get(pkg) {
+                for &pid in pids {
+                    let rss = read_statm_rss_kb(pid, self.page_size_kb);
+                    if rss > 0 {
+                        total_rss_kb += rss;
+                        live_pids.push(pid);
+                    } else {
+                        dead_pids.push(pid);
+                    }
                 }
             }
 
@@ -758,16 +821,27 @@ impl DaemonState {
         }
         for pkg in &dead_pkgs {
             self.alive_apps.remove(pkg);
+            self.pkg_to_pids.remove(pkg);
         }
         for cand in &candidates {
-            if let Some(record) = self.alive_apps.get_mut(&cand.pkg) {
-                record.pids.retain(|p| cand.live_pids.contains(p));
+            if let Some(pids) = self.pkg_to_pids.get_mut(&cand.pkg) {
+                pids.retain(|p| cand.live_pids.contains(p));
             }
         }
 
         candidates.sort_by(|a, b| b.total_rss_kb.cmp(&a.total_rss_kb));
 
         for cand in candidates.into_iter().take(self.config.max_kills_per_pass) {
+            let oom_adj = cand
+                .live_pids
+                .iter()
+                .map(|&p| read_oom_score_adj(p).unwrap_or(0))
+                .min()
+                .unwrap_or(0);
+            if oom_adj < self.config.min_oom_score_adj {
+                continue;
+            }
+
             let reason = if is_game {
                 "game_mode_escalation"
             } else if is_low_mem {
@@ -797,21 +871,22 @@ impl DaemonState {
                 None => ("simulated_kill", "SIM_KILL", " (simulated)"),
             };
 
-            let json = match is_spawned {
-                Some(spawned) => format!(
-                    r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawned":{}}}"#,
-                    now_epoch, event_name, escape_json(&cand.pkg), cand.live_pids, cand.total_rss_kb, reason, cand.idle_sec, cand.lru_pos, spawned
-                ),
-                None => format!(
-                    r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{}}}"#,
-                    now_epoch, event_name, escape_json(&cand.pkg), cand.live_pids, cand.total_rss_kb, reason, cand.idle_sec, cand.lru_pos
-                ),
+            let spawned_val = match is_spawned {
+                Some(v) => if v { "true" } else { "false" },
+                None => "null",
             };
+            let json = format!(
+                r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{}}}"#,
+                now_epoch, event_name, escape_json(&cand.pkg), cand.live_pids, cand.total_rss_kb, reason, cand.idle_sec, cand.lru_pos, spawned_val, oom_adj
+            );
 
             self.telemetry.emit_with(
                 || {
                     let time_str = format_time_hms_ms(now_epoch);
-                    let detail = format!("rss={}MB  idle={}s  lru={} [{}] {}", rss_mb, cand.idle_sec, cand.lru_pos, reason, sim_suffix);
+                    let detail = format!(
+                        "rss={}MB  idle={}s  adj={}  lru={} [{}] {}",
+                        rss_mb, cand.idle_sec, oom_adj, cand.lru_pos, reason, sim_suffix
+                    );
                     format!("{:<12}   {:<12} {:<26} {}", time_str, tag, cand.pkg, detail)
                 },
                 &json,
@@ -843,11 +918,13 @@ impl DaemonState {
     }
 
     fn run(&mut self) {
-        println!(
-            "[DAEMON] mini-lmk active (mode: {}).",
-            if self.act_mode { "ACT" } else { "OBSERVE" }
-        );
-        println!("[DAEMON] Monitoring FDs: [TOKEN_LOGCAT_PIPE, TOKEN_INOTIFY]");
+        if !self.json_stdout {
+            println!(
+                "[DAEMON] mini-lmk active (mode: {}).",
+                if self.act_mode { "ACT" } else { "OBSERVE" }
+            );
+            println!("[DAEMON] Monitoring FDs: [TOKEN_LOGCAT_PIPE, TOKEN_INOTIFY]");
+        }
 
         if !self.telemetry.json_stdout {
             println!("{:<12}   {:<12} {:<26} {}", "# TIME", "EVENT", "TARGET", "DETAIL / REASON");
@@ -876,7 +953,6 @@ impl DaemonState {
                 std::process::exit(1);
             }
 
-            // Non-blocking reap of any background child processes (e.g. cmd activity kill)
             self.reap_terminated_children();
 
             for i in 0..nfds as usize {
@@ -959,7 +1035,9 @@ impl DaemonState {
                                 break;
                             }
                         }
-                        println!("[CONFIG] Configuration directory updated. Reloading...");
+                        if !self.json_stdout {
+                            println!("[CONFIG] Configuration directory updated. Reloading...");
+                        }
                         self.ensure_inotify_watch();
                         self.reload_configs();
                     }
@@ -968,7 +1046,9 @@ impl DaemonState {
             }
         }
 
-        println!("[DAEMON] Shutdown signal received. Exiting.");
+        if !self.json_stdout {
+            println!("[DAEMON] Shutdown signal received. Exiting.");
+        }
         if let Some(mut child) = self.logcat_child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -994,28 +1074,39 @@ impl DaemonState {
     }
 }
 
+fn print_help() {
+    println!(
+        r#"mini-lmk - Rootless event-driven memory manager for Android 10+ (API 29+)
+Usage: mini-lmk <MODE> [OPTIONS]
+
+Modes:
+  --observe        Run in observation mode (simulate kills, emit telemetry)
+  --act            Execute real kills via `cmd activity kill --user all`
+
+Options:
+  --json           Emit raw NDJSON to stdout instead of tabular columnar format
+  -h, --help       Print this help message"#
+    );
+}
+
 fn main() {
-    let mut act_mode = false;
+    let mut mode = None;
     let mut json_stdout = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
-            "--act" => act_mode = true,
-            "--observe" => act_mode = false,
+            "--act" => mode = Some(true),
+            "--observe" => mode = Some(false),
             "--json" => json_stdout = true,
-            "-h" | "--help" => {
-                println!("mini-lmk - Rootless event-driven memory manager for Android 10+ (API 29+)");
-                println!("Usage: mini-lmk [OPTIONS]\n");
-                println!("Options:");
-                println!("  --observe        Run in observation mode (simulate kills, emit telemetry) [default]");
-                println!("  --act            Execute real kills via `cmd activity kill --user all`");
-                println!("  --json           Emit raw NDJSON to stdout instead of tabular columnar format");
-                println!("  -h, --help       Print this help message");
-                return;
-            }
+            "-h" | "--help" => return print_help(),
             other => eprintln!("[WARN] Unknown argument: {}", other),
         }
     }
+
+    let Some(act_mode) = mode else {
+        eprintln!("[ERROR] Operating mode must be specified: use --observe or --act\n");
+        return print_help();
+    };
 
     println!("=== mini-lmk daemon ===");
     DaemonState::new(act_mode, json_stdout).run();
