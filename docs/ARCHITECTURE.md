@@ -42,7 +42,7 @@ Prior to entering `epoll_wait()`, the daemon executes an instantaneous sanity ch
 
 #### Signal Handling & Child Reaping
 * POSIX signals `SIGINT` and `SIGTERM` are registered with `sa_flags = 0` (strictly **no `SA_RESTART`**), ensuring `epoll_wait()` returns `EINTR` immediately upon signal delivery for clean shutdown.
-* Broken pipe (`SIGPIPE`) is explicitly ignored (`SIG_IGN`). Because the binary is built with `panic = "abort"`, a `println!` whose `write(2)` fails on a detached terminal would escalate a lost log line into `SIGABRT`; all writes therefore go through `let _ = writeln!(stdout(), ..)` / `writeln!(stderr(), ..)`, so a disappearing consumer costs output, never the daemon. The terminal table and its column header are additionally gated on `isatty(1)` (§5.2), which keeps the supervisor's `stdout.log` free of event rows, while the one-shot startup banners are gated only on `--json` — that is what lets `scripts/benchmark.sh` keep grepping `Indexed` and `Monitoring FDs` from a redirected stdout.
+* Broken pipe (`SIGPIPE`) is explicitly ignored (`SIG_IGN`). Because the binary is built with `panic = "abort"`, a `println!` whose `write(2)` fails on a detached terminal would escalate a lost log line into `SIGABRT`; all writes therefore go through `let _ = writeln!(stdout(), ..)` / `writeln!(stderr(), ..)`, so a disappearing consumer costs output, never the daemon. The terminal table, its column header, and the `=== mini-lmk daemon ===` line are additionally gated on `isatty(1)` (§5.2): the shipped `service.sh` sends stdout to `/dev/null`, and a manual supervisor loop that pipes it into a file wants the progress banners, not the event rows. Those two banners (`Indexed`, `Monitoring FDs`) are gated on nothing but `--json` — that is what lets `scripts/benchmark.sh` keep grepping them from a redirected stdout.
 * Terminated child processes (`logcat` or asynchronous `cmd activity kill` invocations) are reaped non-blocking after `epoll_wait()` unblocks via `libc::waitpid(-1, &mut status, WNOHANG)`.
 
 ### 1.3 Unified Native Event Stream
@@ -165,7 +165,7 @@ struct DaemonState {
 }
 ```
 
-Only the fields the surrounding sections reason about are listed; see `src/main.rs` for the complete set (the remaining entries are the aggregated `SessionStats` counters, `game_intrusion_count`, `page_size_kb`, `json_stdout`, the `epoll`/`logcat`/`inotify` descriptors, and the spawned `logcat` child).
+Only the fields the surrounding sections reason about are listed; see `src/main.rs` for the complete set (the remaining entries are the aggregated `SessionStats` counters, `game_intrusion_count`, `page_size_kb`, `json_stdout`, `no_log_cli`, the `epoll`/`logcat`/`inotify` descriptors, and the spawned `logcat` child).
 
 Every timestamp field above is a `u64` epoch millisecond; the four anchor fields (`screen_on_start`, `screen_off_start`, `game_session_start`, `session_start`) are rebased together with `alive_apps` and `recent_deaths` by `apply_clock_jump` (§2.3).
 
@@ -301,7 +301,7 @@ When multiple candidate packages qualify for eviction simultaneously:
 
 ## 4. Runtime Configuration & Tuning Parameters
 
-The following parameters in `daemon.conf` are live-calibrated via inotify. Their default values serve as baseline estimates and are subject to calibration based on empirical traces recorded in `<base>/logs/operations.log`:
+The following parameters in `daemon.conf` are live-calibrated via inotify (the last row, `log_enabled`, is an output switch rather than a tuning knob). Their default values serve as baseline estimates and are subject to calibration based on empirical traces recorded in `<base>/logs/operations.log`:
 
 | Parameter | Default | Range / Scale | Description & Calibration Target |
 |---|---|---|---|
@@ -312,6 +312,7 @@ The following parameters in `daemon.conf` are live-calibrated via inotify. Their
 | `screen_off_harvest` | `true` | `bool` | Enables opportunistic screen-off maintenance during Doze heartbeats (`device_idle_light_step`). |
 | `max_kills_per_pass` | Auto-scaled at bootstrap (`4` / `2` / `1` by RAM; `2` in `RuntimeConfig::default()`) | `usize` >= 1 (floored at 1, no upper clamp) | Eviction burst cap. Auto-scales by physical RAM: `<=4.5 GB` -> 4, `4.5–8.5 GB` -> 2, `>8.5 GB` -> 1. |
 | `min_oom_score_adj` | `900` | `i32` (`500`–`900`) | Minimum OOM score required for eviction eligibility. Clamped to `500..=900`. `900` targets cached/idle processes; `500` extends reclamation to background services. |
+| `log_enabled` | `true` | `bool` | Whether `operations.log` is written (§5.2). Not a tuning knob: it changes no decision, and an unparseable value keeps the previous setting. `--no-log` overrides it for one process. |
 
 ---
 
@@ -329,6 +330,8 @@ To prevent inotify feedback loops where log emission re-triggers configuration r
     ├── operations.log       <-- Live NDJSON event stream (512 KB max)
     └── operations.log.old   <-- Rotated backup file
 ```
+
+`<base>` is `$MODPATH/mlmk` in the installed module. The module zip ships no `mlmk/` tree at all -- `customize.sh` creates `config/` and `logs/` and touches the two lists whenever they are missing -- so whether a hand-written `daemon.conf` survives an upgrade depends on whether AxManager's installer replaces the module directory, which is not ours to control. Treat `$MODPATH/mlmk/config/` as not surviving an upgrade and re-check it after flashing; the standalone `/data/local/tmp/mlmk/` tree is outside the module directory and is left alone.
 
 ### 5.1 Configuration Files (`config/`)
 
@@ -354,6 +357,10 @@ screen_off_harvest=true
 # 900: Conservative (cached & idle processes only; protects all background services)
 # 500: Aggressive (matches AOSP SERVICE_ADJ; reclaims background services for games/heavy loads)
 min_oom_score_adj=900
+
+# Append records to logs/operations.log (§5.2). Telemetry only: kill decisions, the
+# terminal table and the --json stream are unaffected when it is false.
+# log_enabled=true
 ```
 
 #### Exclusions (`config/exclude.list`)
@@ -378,24 +385,28 @@ Package names triggering Game Mode entry flushing (`T_idle -> 10s`). **Empty by 
 
 ### 5.2 Telemetry Logging Format (`logs/operations.log`)
 
-The daemon writes structured Newline-Delimited JSON (NDJSON) through an 8 KB `BufWriter`, with automatic 512 KB log rotation (`operations.log.old`, permissions `0666` on Unix). Individual process lifecycle spawns and exits are aggregated into `bg_summary` events to prevent log spam and disk thrashing: the record is suppressed entirely when both counters are zero, and its `interval_sec` is the window being summarized — time since the previous summary on a foreground switch, or the active/sleep duration of the screen session that just ended on a `screen_state` transition.
+The daemon writes structured Newline-Delimited JSON (NDJSON) through an 8 KB `BufWriter`, with automatic 512 KB log rotation (`operations.log.old`, permissions `0666` on Unix). Individual process lifecycle spawns and exits are aggregated into `bg_summary` events instead of getting a line each: the record is suppressed entirely when both counters are zero, and its `interval_sec` is the window being summarized — time since the previous summary on a foreground switch, or the active/sleep duration of the screen session that just ended on a `screen_state` transition.
 
-**Write discipline.** `write_to_log` appends into the buffer and does not flush per line; the reactor flushes once per `epoll_wait` batch, and every `std::process::exit` path flushes first because `exit` skips destructors. A kill record is flushed immediately after it is emitted, so the reap decision is on disk before the handler returns to the batch — `cmd activity kill` is spawned *before* the record is built (the `spawned` field reports the outcome of that spawn), so the flush is about visibility, not about the child inheriting buffered state, which neither `posix_spawn` nor the `O_CLOEXEC` descriptor Rust opens the log with would permit. The tradeoff: a `SIGABRT` landing between two flushes discards the records still in the buffer — at most the events of one batch. No `fsync` is performed, so durability against power loss is unchanged from the earlier per-line policy. Measured cost of one 190-byte `fg_switch` record (§6.2): P50 **1.23 µs → 77 ns**, mean 1.57 µs → 385.6 ns, P99 5.46 µs → 8.62 µs, because the cost now lands on the batch boundary.
+**The file is optional.** A `log_enabled` key in `daemon.conf` (default `true`) and a `--no-log` flag decide whether the sink opens `operations.log` at all. The config value is re-read on every `inotify` reload, so flipping it takes effect without a restart; the CLI flag wins over the file and cannot be undone by a reload, because a daemon started with `--no-log` is an operator's decision about that process. Disabled from the start, the file is never created; disabled at runtime, it closes after flushing. Either way records emitted while disabled are dropped rather than queued, which is the same thing that already happens when the file cannot be opened, and the `config_reload` record naming the new state is the reason (it is written while the switch is still in the old state when disabling, and after it when enabling, so it always lands where the record says it will). Whether the sink holds a descriptor *is* that switch — `TelemetrySink` keeps no separate flag for it — so enabling after a previously failed open retries the open instead of believing logging is already on. Rotation is checked before an append, and the size checked is the one the inode reports at open time rather than the daemon's own running total, which cannot move while the writer is closed: re-enabling after a long disabled period therefore rotates if the file passed 512 KB during it, and a truncated file is not rotated early (verified on the reference device: growing `operations.log` to 600 KB while the switch was off produced an `operations.log.old` of that size and a new file holding one record). Both paths are verified on the reference device: `--no-log` and `log_enabled=false` each leave no `operations.log` behind, and an inotify reload to `log_enabled=true` starts the file again with the announcing `config_reload` record as its first line. What that record says about `log_enabled` is the effective switch, not the config value alone — see below.
 
-**Routing rules** (`TelemetrySink::emit_with`) — each call site passes the JSON and terminal-table renderings as closures, so a rendering with no destination is never built:
+**Write discipline.** `write_to_log` appends into the buffer and does not flush per line; the reactor flushes once per `epoll_wait` batch. Termination goes through one flush-then-exit helper (`DaemonState::fatal`, whose `!` return type makes a failure path that skips the flush uncompilable) rather than an `exit` call at each site, because `exit` skips destructors and a daemon has no terminal to complain to. A batch that emitted no record costs no syscall at all — an empty `BufWriter::flush()` writes nothing and `File::flush()` performs no syscall, so no dirty flag is needed. The first config load of every run is recorded even when `daemon.conf` is absent or matches the defaults, so the file's first line is always the configuration in force; that record is flushed immediately instead of waiting for a batch, because the quiet device it describes may never produce one and `SIGKILL` — how a module upgrade stops the daemon — would take the baseline with it. Confirmed on the reference device with `strace -f -e trace=openat,write`: over a 70 s idle run the log descriptor (fd 5, `O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC`) received exactly one `write(2)` of 224 bytes — that startup record — and nothing else, while the other 13 writes were 12 startup progress banners on fd 1 (stdout, redirected to `/dev/null` — a discarded write is still a syscall, which is exactly why the event table is gated rather than written and ignored) plus one `logcat` child diagnostic on fd 3. The complementary trace: three `daemon.conf` edits that each changed a value produced three more records in three more writes, and a fourth rewrite that changed nothing produced neither, because one `inotify` reload is one batch. Amortization therefore shows up only where a single batch carries several records — a logcat burst — and its cost shape is the pair of `write_to_log` rows in §6.2. A kill record is flushed immediately after it is emitted, so the reap decision is on disk before the handler returns to the batch — `cmd activity kill` is spawned *before* the record is built (the `spawned` field reports the outcome of that spawn), so the flush is about visibility, not about the child inheriting buffered state, which neither `posix_spawn` nor the `O_CLOEXEC` descriptor Rust opens the log with would permit. The tradeoff: a `SIGABRT` landing between two flushes discards the records still in the buffer — at most the events of one batch. No `fsync` is performed, so durability against power loss is unchanged from the earlier per-line policy. Measured cost of one 190-byte `fg_switch` record (§6.2): P50 **1.23 µs → 77 ns**, mean 1.55 µs → 389.3 ns, P99 5.23 µs → 8.54 µs, because the cost now lands on the batch boundary.
+
+**Routing rules** (`TelemetrySink::emit_with`) — each call site passes the JSON and terminal-table renderings as closures, so a rendering with no destination is never built. The first `config_reload` of a run is *deferred* rather than routed differently: `DaemonState::new()` loads the configuration long before `run()` prints the table header, so it holds the record and `run()` renders it once the header exists — emitted at the discovery point put a data row above the header it belongs to, among the startup banners. `DaemonState::fatal` drains it too, so a daemon that dies during initialisation still leaves the baseline. It is flushed at once either way: `SIGKILL` is how a module upgrade stops the daemon, and the record would otherwise sit in the 8 KB buffer.
 
 | `json_stdout` | stdout destination | log destination | what is built | what is written |
 |---|---|---|---|---|
 | `false` (default) | terminal | open | tabular + JSON | terminal table, log |
+| `false` | terminal | closed (`log_enabled=false`) | tabular only | terminal table |
 | `false` | `/dev/null` or closed | open | JSON only | log |
 | `false` | `/dev/null` | closed | nothing | nothing |
 | `true` (`--json`) | any | open | JSON once | same buffer to both |
+| `true` (`--json`) | any | closed | JSON once | stdout only |
 
-The `isatty(1)` gate is consulted once in `TelemetrySink::new()`, never on the hot path, and `--json` is treated as a machine contract: its NDJSON goes to stdout even when stdout is a pipe or `/dev/null`. `operations.log` is written in every mode — including the `service.sh` case, where stdout is discarded and only the log receives records — so the only branch where `emit_with` drops an event is a sink whose log failed to open and whose stdout is neither a terminal nor asked for JSON.
+The `isatty(1)` gate is consulted once in `TelemetrySink::new()`, never on the hot path, and `--json` is treated as a machine contract: its NDJSON goes to stdout even when stdout is a pipe or `/dev/null`. The stdout gate and the file decision are independent — `service.sh` discards stdout precisely so that `operations.log` is the only surviving record — which means the only branch where `emit_with` drops an event entirely is a sink whose log is unavailable (closed by `log_enabled`/`--no-log`, or failed to open) and whose stdout is neither a terminal nor asked for JSON. Under the shipped `service.sh`, that branch is the *default* configuration once logging is switched off: stdout goes to `/dev/null`, so a disabled log leaves a daemon that records nothing anywhere. `run-daemon.sh` and `service.sh` forward every argument to the binary, so `--no-log` can be passed through the module; `log_enabled` in `daemon.conf` needs no caller edit, but it lives under `$MODPATH/mlmk/config/` and therefore resets to `true` on a module flash, exactly like `exclude.list` and `games.list`.
 
-The emitted event vocabulary is exactly `kill`, `kill_skipped`, `simulated_kill`, `fg_switch`, `screen_state`, `bg_summary`, `respawn`, `game_intrusion`, `game_session_start`, `game_session_end`, and `config_reload`. `am_proc_died` produces **no** record of its own: deaths only surface as the `deaths` counter inside the next `bg_summary`, or as a `respawn` record when the package returns within 120 s.
+The emitted event vocabulary is exactly `kill`, `kill_skipped`, `simulated_kill`, `fg_switch`, `screen_state`, `bg_summary`, `respawn`, `game_intrusion`, `game_session_start`, `game_session_end`, and `config_reload`. `am_proc_died` produces **no** record of its own: deaths only surface as the `deaths` counter inside the next `bg_summary`, or as a `respawn` record when the package returns within 120 s. `config_reload` is the one record whose `ts` is not event-sourced (an `inotify` event carries no framework timestamp); it is emitted on the first load of every run and afterwards only when the parsed `RuntimeConfig` differs from the running one, which is what makes the first line of `operations.log` the configuration in force. It carries every key of the struct, including `min_oom_score_adj` and `log_enabled` — the latter reporting the *effective* switch (`config AND not --no-log`) rather than the config value, because a daemon started with `--no-log` still reads `log_enabled = true` from a file it was told to ignore.
 
-The examples below are one representative record per event. Note that `config_reload` is emitted only when a reload actually changed a value, and its `ts` is the one non-event-sourced timestamp in the stream (§1.3); `game_session_start` / `game_session_end` require a `games.list` match.
+The examples below are one representative record per event; `game_session_start` / `game_session_end` require a `games.list` match.
 
 ```json
 {"ts":1790255284675,"event":"screen_state","state":"OFF","active_duration_sec":1850}
@@ -409,7 +420,7 @@ The examples below are one representative record per event. Note that `config_re
 {"ts":1790255289004,"event":"game_session_start","pkg":"com.miHoYo.GenshinImpact"}
 {"ts":1790255291006,"event":"game_session_end","duration_sec":142,"intrusions":2}
 {"ts":1790255292210,"event":"simulated_kill","pkg":"com.twitter.android","pids":[15120],"rss_freed_est_kb":208896,"reason":"idle_expired","idle_sec":322,"lru_pos":6,"spawned":false,"oom_score_adj":950,"ams_protected":false,"spawn_skipped":false}
-{"ts":1790255293004,"event":"config_reload","t_idle_sec":180,"lru_protect_depth":3,"mem_critical_percent":10,"fg_lru_max_depth":10,"screen_off_harvest":true,"max_kills_per_pass":2}
+{"ts":1790255293004,"event":"config_reload","t_idle_sec":180,"lru_protect_depth":3,"mem_critical_percent":10,"fg_lru_max_depth":10,"screen_off_harvest":true,"max_kills_per_pass":2,"min_oom_score_adj":900,"log_enabled":true}
 ```
 
 ---
@@ -440,8 +451,8 @@ Evaluated via `benches/microbench.rs` across 1,000 warm-up cycles and 10,000 tim
 | `procfs::read_statm_rss_kb` | multi-PID pool (cold) | 10,000 | 6.46 µs | **8.31 µs** | 10.77 µs | 12.85 µs | 851.08 µs | 9.23 µs | 4 |
 | `procfs::read_meminfo_kb` | `/proc/meminfo` | 10,000 | 8.31 µs | **9.23 µs** | 10.54 µs | 23.31 µs | 610.23 µs | 9.90 µs | 2 |
 | `telemetry::FormattedTime` | Stack buffer timestamp | 10,000 | 76.0 ns | **308.0 ns** | 308.0 ns | 308.0 ns | 3.46 µs | 281.5 ns | 0 |
-| `telemetry::write_to_log` | NDJSON append, flushed every line (previous policy) | 10,000 | 1.00 µs | **1.23 µs** | 1.46 µs | 5.46 µs | 494.54 µs | 1.57 µs | 0 |
-| `telemetry::write_to_log` | NDJSON append, flushed every 64 lines (current policy) | 10,000 | 0.0 ns | **77.0 ns** | 231.0 ns | 8.62 µs | 346.23 µs | 385.6 ns | 0 |
+| `telemetry::write_to_log` | NDJSON append, flushed every line (previous policy) | 10,000 | 1.00 µs | **1.23 µs** | 1.46 µs | 5.23 µs | 541.85 µs | 1.55 µs | 0 |
+| `telemetry::write_to_log` | NDJSON append, no per-line flush (current) | 10,000 | 0.0 ns | **77.0 ns** | 231.0 ns | 8.54 µs | 406.23 µs | 389.3 ns | 0 |
 | `Instant::now` (Overhead) | Harness baseline (not on daemon hot path) | 10,000 | 0.0 ns | **231.0 ns** | 308.0 ns | 308.0 ns | 1.00 µs | 214.9 ns | 0 |
 
 #### Architectural Key Takeaways:

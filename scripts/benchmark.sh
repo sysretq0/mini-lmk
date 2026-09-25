@@ -162,7 +162,10 @@ while [ "$i" -le "$ITERS" ]; do
     "$DAEMON_BIN" --observe > "$LOG_FILE" 2>&1 &
     DAEMON_PID=$!
 
-    # Wait for cold-start discovery completion
+    # Wait for cold-start discovery completion.
+    # These two banners are the harness's only synchronisation points, and this run has no
+    # terminal (stdout is a file), so they must stay gated on `--json` alone and never on
+    # isatty(1) the way the event table is — otherwise every run times out right here.
     WAIT_COUNT=0
     while ! grep -q "Indexed" "$LOG_FILE" 2>/dev/null; do
         sleep 0.005

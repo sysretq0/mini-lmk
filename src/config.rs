@@ -74,6 +74,7 @@ pub struct RuntimeConfig {
     pub screen_off_harvest: bool,
     pub max_kills_per_pass: usize,
     pub min_oom_score_adj: i32,
+    pub log_enabled: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -86,6 +87,7 @@ impl Default for RuntimeConfig {
             screen_off_harvest: true,
             max_kills_per_pass: 2,
             min_oom_score_adj: 900,
+            log_enabled: true,
         }
     }
 }
@@ -138,6 +140,11 @@ impl RuntimeConfig {
                             self.min_oom_score_adj = num.clamp(500, 900);
                         }
                     }
+                    "log_enabled" => {
+                        if let Ok(b) = val.parse::<bool>() {
+                            self.log_enabled = b;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -149,8 +156,8 @@ impl RuntimeConfig {
             self.parse_str(&text);
             if !quiet {
                 let _ = writeln!(stdout(),
-                    "[CONFIG] Active: t_idle={}s, lru_depth={}, mem_crit={}%, fg_lru_max={}, screen_off_harvest={}, max_kills_per_pass={}, min_oom_adj={}",
-                    self.t_idle_sec, self.lru_protect_depth, self.mem_critical_percent, self.fg_lru_max_depth, self.screen_off_harvest, self.max_kills_per_pass, self.min_oom_score_adj
+                    "[CONFIG] Active: t_idle={}s, lru_depth={}, mem_crit={}%, fg_lru_max={}, screen_off_harvest={}, max_kills_per_pass={}, min_oom_adj={}, log_enabled={}",
+                    self.t_idle_sec, self.lru_protect_depth, self.mem_critical_percent, self.fg_lru_max_depth, self.screen_off_harvest, self.max_kills_per_pass, self.min_oom_score_adj, self.log_enabled
                 );
             }
         }
@@ -187,6 +194,7 @@ mod tests {
         assert!(cfg.screen_off_harvest);
         assert_eq!(cfg.max_kills_per_pass, 2);
         assert_eq!(cfg.min_oom_score_adj, 900);
+        assert!(cfg.log_enabled, "on unless daemon.conf says otherwise");
 
         let content = "
             # /data/local/tmp/mlmk/config/daemon.conf
@@ -198,6 +206,7 @@ mod tests {
             screen_off_harvest = false
             max_kills_per_pass = 4
             min_oom_score_adj = 700
+            log_enabled = false
             # Unknown keys should be safely ignored
             invalid_key = 999
         ";
@@ -209,6 +218,13 @@ mod tests {
         assert!(!cfg.screen_off_harvest);
         assert_eq!(cfg.max_kills_per_pass, 4);
         assert_eq!(cfg.min_oom_score_adj, 700);
+        assert!(!cfg.log_enabled);
+
+        // An unparseable value leaves the previous setting alone rather than guessing
+        cfg.parse_str("log_enabled = maybe");
+        assert!(!cfg.log_enabled);
+        cfg.parse_str("log_enabled = true");
+        assert!(cfg.log_enabled);
 
         // Enforce lower bound of 1 for max_kills_per_pass
         cfg.parse_str("max_kills_per_pass = 0");

@@ -18,7 +18,7 @@ An event-driven userspace memory manager for Android 7.0+ (API 24+) running unde
 * **Fail-Closed System Safety:** Index-only cold boot discovery and strict `uid >= 10000` guards guarantee low-UID system daemons and platform services are never terminated.
 * **External Process Supervision:** Follows fail-fast systems design. If the upstream logcat pipe yields `EOF` or `EPOLLHUP`, the daemon exits immediately and cleanly, delegating process resurrection to an external supervisor loop (`run-daemon.sh`).
 * **Hardware-Scaled Burst Limits:** Sets eviction burst limits (`max_kills_per_pass`) to physical RAM detected at startup, protecting system_server Binder IPC queues from saturation.
-* **Output-Gated Telemetry:** The dual-output sink builds both formatter halves lazily and renders the aligned terminal table only when fd 1 is actually a terminal (`--json` overrides the gate with a raw NDJSON stream), so a background daemon whose stdout goes to `/dev/null` pays neither the `localtime_r` nor the extra `String` for output nobody reads. `operations.log` is flushed once per `epoll_wait` batch — and on every exit path — instead of once per record. 512 KB rotation bounds disk usage.
+* **Output-Gated Telemetry:** The dual-output sink builds both formatter halves lazily, so each one costs nothing unless it has somewhere to go: the aligned terminal table runs only when fd 1 is actually a terminal, and the JSON only when `--json` was asked for or the log is open. A background daemon that redirects stdout to `/dev/null` therefore pays no `localtime_r` and no table `String`, and `--no-log` additionally drops the JSON formatting. `operations.log` is flushed once per `epoll_wait` batch — and on every exit path — instead of once per record, 512 KB rotation bounds disk usage, and `log_enabled` / `--no-log` switch the file off entirely without touching any decision the daemon makes.
 
 ---
 
@@ -91,7 +91,7 @@ mini-lmk/
 │   ├── hasher.rs            # In-tree 64-bit FNV-1a hasher (zero-dependency)
 │   ├── parser.rs            # Zero-copy epoch logcat dispatcher and event fallbacks
 │   ├── procfs.rs            # Stack-buffered /proc readers (statm, meminfo, oom_score_adj)
-│   ├── telemetry.rs         # Dual-output TelemetrySink with 512 KB log rotation
+│   ├── telemetry.rs         # Dual-output TelemetrySink: isatty-gated table, 512 KB rotation, log_enabled off switch
 │   └── main.rs              # Epoll reactor, state machine, and eviction pipeline
 ├── Cargo.lock               # Deterministic dependency manifest
 ├── Cargo.toml               # Package manifest and release profile optimizations
@@ -106,11 +106,11 @@ mini-lmk/
 
 ## Configuration
 
-Configuration files reside under `<base>/config/` (dynamically resolved to `$MODPATH/mlmk/config/` in AxManager, or `/data/local/tmp/mlmk/config/` for standalone ADB execution) and are reloaded via `inotify` when modified. The installer creates `exclude.list` and `games.list` (both empty); `daemon.conf` is **not** shipped — until you create it, the compiled defaults in the table below are in effect, and an unreadable file silently keeps them.
+Configuration files reside under `<base>/config/` (dynamically resolved to `$MODPATH/mlmk/config/` in AxManager, or `/data/local/tmp/mlmk/config/` for standalone ADB execution) and are reloaded via `inotify` when modified. The installer creates `exclude.list` and `games.list` (both empty); `daemon.conf` is **not** shipped — until you create it, the compiled defaults in the table below are in effect, and an unreadable file silently keeps them. The module zip itself ships no configuration: `customize.sh` recreates `config/` and `logs/` and touches the two lists on every flash, so treat a hand-written `daemon.conf` (and any `log_enabled` in it) as not surviving a module upgrade and re-check it after flashing; the standalone `/data/local/tmp/mlmk/` tree is outside the module directory and is left alone.
 
 ### `daemon.conf`
 
-Live runtime parameters:
+Live runtime parameters. The first seven are memory-management policy; `log_enabled` is the telemetry switch:
 
 ```ini
 # Base background idle timeout before eviction eligibility (seconds)
@@ -136,6 +136,10 @@ screen_off_harvest=true
 # 900: Conservative (cached & idle processes only; protects all background services)
 # 500: Aggressive (matches AOSP SERVICE_ADJ; reclaims background services for games/heavy loads)
 min_oom_score_adj=900
+
+# Append records to logs/operations.log. Telemetry only: kill decisions, the terminal
+# table and the --json stream are unaffected. --no-log overrides this per process.
+# log_enabled=true
 ```
 
 | Parameter | Default | Range / Scale | Description |
@@ -147,6 +151,7 @@ min_oom_score_adj=900
 | `screen_off_harvest` | `true` | `bool` | Accelerates idle decay and narrows LRU depth to 1 during screen-off Doze cycles. |
 | `max_kills_per_pass` | `2` (auto-scaled) | `usize` >= 1 | Eviction burst cap. Default scales by RAM: `<=4.5GB` -> 4, `4.5-8.5GB` -> 2, `>8.5GB` -> 1. |
 | `min_oom_score_adj` | `900` | `500`–`900` | Minimum OOM score required for eviction. `900` protects services; `500` reclaims background services. |
+| `log_enabled` | `true` | `bool` | Whether `operations.log` is written. The one non-policy key in the file — see [Turning the Log Off](#turning-the-log-off). |
 
 ### `exclude.list`
 
@@ -210,7 +215,7 @@ adb shell /data/local/tmp/mini-lmk --act
 adb shell "nohup sh -c 'while /data/local/tmp/mini-lmk --act; do sleep 2; done' > /data/local/tmp/mlmk/logs/stdout.log 2>&1 &"
 ```
 
-> **Note on `run-daemon.sh`:** this supervisor script targets the installed module layout only — it resolves the binary from `$MODPATH/system/bin/mini-lmk` or `$MODPATH/bin/<abi>/mini-lmk` and exports `MODPATH` (which also moves the daemon's base directory to `<script dir>/mlmk`). Copied next a bare binary it exits `binary not found`; use the inline loop above for standalone ADB runs.
+> **Note on `run-daemon.sh`:** this supervisor script targets the installed module layout only — it resolves the binary from `$MODPATH/system/bin/mini-lmk` or `$MODPATH/bin/<abi>/mini-lmk` and exports `MODPATH` (which also moves the daemon's base directory to `<script dir>/mlmk`). Copied next a bare binary it exits `binary not found`; use the inline loop above for standalone ADB runs. Every argument is forwarded to the binary, so `sh run-daemon.sh --act --no-log` reaches the daemon intact; with no arguments it starts `--act`, which is what the installer's `service.sh` gets.
 
 ### Command-Line Arguments
 
@@ -220,7 +225,8 @@ An operating mode (`--observe` or `--act`) must be explicitly specified:
 |---|---|
 | `--observe` | Run in observation mode (emits telemetry and simulates candidate kills; safe mode). |
 | `--act` | Run in active enforcement mode (`cmd activity kill --user all <pkg>`). |
-| `--json` | Output raw NDJSON directly to stdout instead of the formatted columnar table. |
+| `--json` | Send NDJSON to stdout instead of the columnar table. stdout is a machine contract in this mode: no banner, no table, one record per line. Without it, the table is written only when fd 1 is a terminal (§ [Telemetry & Monitoring](#telemetry--monitoring)). |
+| `--no-log` | Never write `operations.log` (see [Telemetry & Monitoring](#telemetry--monitoring)). Overrides `log_enabled` in `daemon.conf` for this process; stdout surfaces are unaffected. |
 | `-h`, `--help` | Display usage and help manual. |
 
 ---
@@ -240,7 +246,7 @@ Live operations are formatted into aligned columns on standard output:
 14:25:40.201   BG_SUMMARY   --                         interval=144s  spawns=5  deaths=4  rss_delta=+12MB
 ```
 
-All operations are simultaneously written to `<base>/logs/operations.log` in structured NDJSON format (including the event-sourced `ts` epoch-millisecond timestamp, `oom_score_adj`, `ams_protected`, and `spawn_skipped` fields), rotating to `operations.log.old` upon exceeding 512 KB.
+All operations are simultaneously written to `<base>/logs/operations.log` in structured NDJSON format (including the event-sourced `ts` epoch-millisecond timestamp, `oom_score_adj`, `ams_protected`, and `spawn_skipped` fields), rotating to `operations.log.old` upon exceeding 512 KB, unless switched off by `log_enabled` or `--no-log` (see [Turning the Log Off](#turning-the-log-off)).
 
 ### Where Each Format Actually Goes
 
@@ -252,21 +258,30 @@ The table above is for a human at a terminal. Both formatter halves are closures
 | `mini-lmk --observe --json` on a terminal | NDJSON | NDJSON | 1 per record | 1 per event batch |
 | `service.sh` (stdout → `/dev/null`) | *nothing* | NDJSON | 0 | 1 per event batch |
 | `mini-lmk --observe --json \| axcore` | NDJSON | NDJSON | 1 per record | 1 per event batch |
+| `mini-lmk --observe --no-log` | terminal table (or NDJSON with `--json`) | *nothing* | 1 per record | 0 |
 
-An *event batch* is one `epoll_wait` wakeup: the pipe read loop drains everything logcat has buffered, dispatches every complete line, and the reactor flushes once at the end of the batch, so a burst of lifecycle events costs a single `write(2)` regardless of how many records it produced.
+An *event batch* is one `epoll_wait` wakeup: the pipe read loop drains everything logcat has buffered, dispatches every complete line, and the reactor flushes once at the end of the batch, so a burst of lifecycle events costs a single `write(2)` — unless it overflows the 8 KB buffer, which adds one write per 8 KB (~40 records) — and a wakeup that dispatched nothing costs none, because flushing an empty buffer performs no syscall.
 
-`isatty(1)` decides the terminal table only — its column header and its rows. `--json` is a machine contract, so it stays on even when stdout is a pipe or `/dev/null`, the one-shot startup banners are gated only on `--json` (which is how `scripts/benchmark.sh` still times cold-start discovery from a redirected stdout), and `operations.log` is written in every mode (unless it cannot be opened, in which case a `--json`-less, terminal-less sink skips both formatters entirely).
+`isatty(1)` decides the human surface — the column header and the event rows — and nothing else. `--json` is a machine contract, so it stays on even when stdout is a pipe or `/dev/null`, and the `Indexed` / `Monitoring FDs` progress banners are gated on nothing else (which is how `scripts/benchmark.sh` still times cold-start discovery from a redirected stdout). The `=== mini-lmk daemon ===` line follows the table rather than the banners: it prints only where the table prints, so a redirected stdout gets the progress banners or — under `--json` — the NDJSON contract, never a stray human header.
+
+### Turning the Log Off
+
+A `log_enabled` key in `daemon.conf` (default `true`) and a `--no-log` flag decide whether `operations.log` is opened at all, and nothing else. No kill decision, no terminal table, and no `--json` stream changes when the file stops, so the only reason to own an off switch is an unbounded growth risk the 512 KB rotation does not cover — a device where the `/data` partition is tight, or a diagnosis that should not leave a trail. The config value is re-read on every `inotify` reload, so it can be flipped while the daemon runs from the same tooling that edits `t_idle_sec`; the flag wins over the file and a reload cannot undo it, because a daemon started with `--no-log` is a decision about that process.
+
+Records emitted while the log is off are dropped, not queued — the same thing that already happens when the file cannot be opened — and the `config_reload` record announcing the change is emitted while the switch is still in its previous state when disabling and after it when enabling, so it always lands in the file it describes. Re-enabling re-reads the file size from the inode rather than trusting the daemon's own byte count, which cannot move while the log is closed, so a file that grew or was replaced during a disabled gap still rotates at the cap and a truncated one is not rotated early — checked on the device by growing `operations.log` to 600 KB while the switch was off: re-enabling moved it to `operations.log.old` and started the new file at one record. The first config load of every run is recorded even when `daemon.conf` is absent or matches the defaults, so the first line of the file is always the configuration actually in force. That record is *held* until `run()` has printed the table header rather than emitted where it is discovered — emitting it during construction put a data row above the header it belongs to, eleven lines up among the startup banners — so on a terminal it appears as the first row of the table, and a daemon that dies during initialisation still gets it onto disk through the fatal path.
+
+What the switch actually buys, measured on the reference device: a daemon started with `log_enabled=false` or `--no-log` never creates `operations.log` at all. With the file open, `strace` sees exactly one `write(2)` on the log descriptor for the whole of a 70 s idle run — the 224-byte `config_reload` record written at startup — and nothing afterwards until an event happens; the other 15 writes in that trace go nowhere near the log: 14 are stdout lines redirected to `/dev/null` (the 13 startup `[CONFIG]`/`[SYSTEM]`/`[DAEMON]` lines, plus `[DAEMON] Shutdown signal received` once the run is stopped) and one is a `logcat` child diagnostic on its own descriptor. Three `daemon.conf` edits that each changed a value produced three records and three writes, and a fourth rewrite that changed nothing produced neither: one `inotify` reload is one batch, so a sparse event costs one flush. Logging costs disk only in proportion to real activity, which is why the 512 KB cap and the off switch are belt-and-braces rather than the main defence.
 
 ### Write Discipline
 
-`write_to_log` appends into an 8 KB `BufWriter` and no longer flushes per line. The reactor flushes once after each `epoll_wait` batch, and every `std::process::exit` path flushes first because `exit` skips destructors. The bounded cost is that a `panic = "abort"` crash between the two can lose the records still in the buffer — at most the events of the batch being dispatched. `fsync` is never called, so durability against power loss is unchanged from the previous per-line policy.
+`write_to_log` appends into an 8 KB `BufWriter` and no longer flushes per line. The reactor flushes once after each `epoll_wait` batch, and termination goes through a single flush-then-exit helper because `std::process::exit` skips destructors — a failure path that forgot to flush would lose the run's last records silently, and there is no TTY on a daemon to notice. The bounded cost is that a `panic = "abort"` crash between the two can lose the records still in the buffer — at most the events of the batch being dispatched. `fsync` is never called, so durability against power loss is unchanged from the previous per-line policy.
 
-Measured on the reference device (`benches/microbench.rs`, 10,000 iterations, one 190-byte `fg_switch` record per iteration; the batched row flushes every 64 records as a stand-in for one `epoll_wait` batch of that size):
+Measured on the reference device (`benches/microbench.rs`, 10,000 iterations, one 190-byte `fg_switch` record per iteration; the second row is the shipped record path — the flush lands on the batch boundary, outside the timed call):
 
 | Policy | P50 | Mean | P99 |
 |---|---|---|---|
-| flush every line (previous) | 1.23 µs | 1.57 µs | 5.46 µs |
-| flush every 64 lines (current) | 77 ns | 385.6 ns | 8.62 µs |
+| flush every line (previous) | 1.23 µs | 1.55 µs | 5.23 µs |
+| buffered, per-batch flush (current) | 77 ns | 389.3 ns | 8.54 µs |
 
 The current policy moves the cost off the median record and onto the batch boundary, which is why its P99 is the higher of the two.
 
@@ -288,8 +303,8 @@ Evaluated via the standalone, criterion-free `benches/microbench.rs` harness acr
 | `procfs::read_statm_rss_kb` | multi-PID pool (cold) | 10,000 | 6.46 µs | **8.31 µs** | 10.77 µs | 12.85 µs | 851.08 µs | 9.23 µs | 4 |
 | `procfs::read_meminfo_kb` | `/proc/meminfo` | 10,000 | 8.31 µs | **9.23 µs** | 10.54 µs | 23.31 µs | 610.23 µs | 9.90 µs | 2 |
 | `telemetry::FormattedTime` | Stack buffer timestamp | 10,000 | 76.0 ns | **308.0 ns** | 308.0 ns | 308.0 ns | 3.46 µs | 281.5 ns | 0 |
-| `telemetry::write_to_log` | NDJSON append, flushed every line (previous policy) | 10,000 | 1.00 µs | **1.23 µs** | 1.46 µs | 5.46 µs | 494.54 µs | 1.57 µs | 0 |
-| `telemetry::write_to_log` | NDJSON append, flushed every 64 lines (current) | 10,000 | 0.0 ns | **77.0 ns** | 231.0 ns | 8.62 µs | 346.23 µs | 385.6 ns | 0 |
+| `telemetry::write_to_log` | NDJSON append, flushed every line (previous policy) | 10,000 | 1.00 µs | **1.23 µs** | 1.46 µs | 5.23 µs | 541.85 µs | 1.55 µs | 0 |
+| `telemetry::write_to_log` | NDJSON append, no per-line flush (current) | 10,000 | 0.0 ns | **77.0 ns** | 231.0 ns | 8.54 µs | 406.23 µs | 389.3 ns | 0 |
 | `Instant::now` (Overhead) | Harness baseline (not on daemon hot path) | 10,000 | 0.0 ns | **231.0 ns** | 308.0 ns | 308.0 ns | 1.00 µs | 214.9 ns | 0 |
 
 * **Cold Multi-PID Pool Access:** Reading across a dynamic pool of external system/user PIDs incurs ~8.6 µs P50 latency (vs 3.7 µs for self), comfortably qualifying multi-PID candidate batches in microseconds.

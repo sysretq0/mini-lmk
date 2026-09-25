@@ -61,6 +61,19 @@ struct Candidate {
 struct DaemonState {
     config: RuntimeConfig,
     json_stdout: bool,
+    /// `--no-log`: an explicit CLI request outranks `log_enabled` in daemon.conf, so an inotify
+    /// reload cannot silently re-open a log the operator closed.
+    no_log_cli: bool,
+    /// False until the applied configuration has been recorded. A daemon whose stdout goes to
+    /// `/dev/null` (`service.sh`) leaves `operations.log` as its only artifact and the
+    /// `[CONFIG] Active` line is printed to that stdout, so the first load is announced even when
+    /// it equals the defaults; later loads announce only on an actual change.
+    config_announced: bool,
+    /// The first-load `config_reload` record, held as `(config, effective log switch, epoch ms)`
+    /// until the terminal table exists. Emitted where it was discovered — inside `new()`, long
+    /// before `run()` prints the header — it put one data row above the header it belongs to, among
+    /// the startup banners. Drained by [`Self::emit_startup_record`].
+    startup_record: Option<(RuntimeConfig, bool, u64)>,
 
     // Canonical base package -> last foreground/activity epoch-ms anchor (UID >= 10000 only).
     alive_apps: FastMap<String, u64>,
@@ -190,8 +203,16 @@ pub fn probe_logcat_stream(child: &mut Child, pipe_fd: i32) -> Result<(), &'stat
     Ok(())
 }
 
+/// Report a fatal error and leave the process. Free function because the few startup failures
+/// that happen *before* a telemetry sink exists have nothing to flush; everything after the sink
+/// exists goes through [`DaemonState::fatal`].
+fn fatal_exit(msg: std::fmt::Arguments) -> ! {
+    let _ = writeln!(stderr(), "[FATAL] {msg}");
+    std::process::exit(1)
+}
+
 impl DaemonState {
-    fn new(act_mode: bool, json_stdout: bool) -> Self {
+    fn new(act_mode: bool, json_stdout: bool, no_log_cli: bool) -> Self {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = sig_handler as *const () as usize;
@@ -210,14 +231,12 @@ impl DaemonState {
 
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epoll_fd < 0 {
-            let _ = writeln!(stderr(), "[FATAL] epoll_create1 failed: {}", std::io::Error::last_os_error());
-            std::process::exit(1);
+            fatal_exit(format_args!("epoll_create1 failed: {}", std::io::Error::last_os_error()));
         }
 
         let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if inotify_fd < 0 {
-            let _ = writeln!(stderr(), "[FATAL] inotify_init1 failed: {}", std::io::Error::last_os_error());
-            std::process::exit(1);
+            fatal_exit(format_args!("inotify_init1 failed: {}", std::io::Error::last_os_error()));
         }
 
         let mut ev = libc::epoll_event {
@@ -225,11 +244,19 @@ impl DaemonState {
             u64: TOKEN_INOTIFY,
         };
         if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, inotify_fd, &mut ev) } < 0 {
-            let _ = writeln!(stderr(), "[FATAL] epoll_ctl inotify failed: {}", std::io::Error::last_os_error());
-            std::process::exit(1);
+            fatal_exit(format_args!("epoll_ctl inotify failed: {}", std::io::Error::last_os_error()));
         }
 
-        let telemetry = TelemetrySink::new(&paths.operations_log, json_stdout);
+        // Read daemon.conf once before the log is opened, so `log_enabled = false` means the file
+        // is never created at all rather than created and closed one record later. The
+        // authoritative load is reload_configs(), which also emits the config_reload record.
+        let mut initial_cfg = RuntimeConfig::default();
+        initial_cfg.load_from_file(&paths.config_file, true);
+        let telemetry = TelemetrySink::new(
+            &paths.operations_log,
+            json_stdout,
+            initial_cfg.log_enabled && !no_log_cli,
+        );
 
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page_size_kb = if page_size > 0 { (page_size as u64) / 1024 } else { 4 };
@@ -287,6 +314,9 @@ impl DaemonState {
             act_mode,
             telemetry,
             json_stdout,
+            no_log_cli,
+            config_announced: false,
+            startup_record: None,
             session_start: now,
             // Seed the classifier with the bootstrap read instead of a sentinel, so the
             // unsynchronized-RTC -> NTP step is detected on the *first* event. The only
@@ -412,32 +442,131 @@ impl DaemonState {
         }
     }
 
+    /// Log the pending records, report the failure, and leave. `std::process::exit` skips
+    /// `Drop`, and with stdout on `/dev/null` (`service.sh`) `operations.log` is the only
+    /// post-mortem artifact there is, so flushing cannot be left to each call site to remember:
+    /// termination goes through here or it does not happen at all.
+    fn fatal(&mut self, msg: std::fmt::Arguments) -> ! {
+        // A daemon that dies before `run()` starts still owes the on-disk baseline: this path is how
+        // a module's supervisor learns why the service is crash-looping.
+        self.emit_startup_record();
+        self.telemetry.flush();
+        fatal_exit(msg)
+    }
+
     fn reload_configs(&mut self) {
+        self.reload_configs_from(ConfigPaths::get());
+    }
+
+    /// The reload against an explicit path set. `ConfigPaths::get()` resolves `$MODPATH` once per
+    /// process and otherwise points at `/data/local/tmp/mlmk`, so a test that went through it would
+    /// be reading a `daemon.conf` it never wrote — and the only way to show that the file is applied
+    /// at all is to point the reload at a file the test did write.
+    fn reload_configs_from(&mut self, paths: &ConfigPaths) {
         let prev_cfg = self.config;
-        let paths = ConfigPaths::get();
+        let first_load = !self.config_announced;
         self.config.load_from_file(&paths.config_file, self.json_stdout);
         Self::load_file_lines(&paths.exclude_file, &mut self.user_exclusions, self.json_stdout);
         Self::load_file_lines(&paths.games_file, &mut self.games, self.json_stdout);
 
-        if self.config != prev_cfg {
+        if self.config != prev_cfg || first_load {
+            self.config_announced = true;
+            // The switch is applied around the record rather than after it, so the config_reload
+            // line that announces a change is always written: a re-enable opens the file first so
+            // its own record lands, a disable closes it afterwards so its record is the last line.
+            let want_log = self.config.log_enabled && !self.no_log_cli;
+            // `want_log`, not `self.config.log_enabled`: with `--no-log` the config still says
+            // true while nothing is being written, and a record that claims otherwise is worse
+            // than no record.
+            if want_log {
+                self.telemetry.set_log_enabled(true);
+            }
             let now_epoch = Self::get_epoch_ms();
-            self.telemetry.emit_with(
-                || {
-                    let time_str = format_time_hms_ms(now_epoch);
-                    let detail = format!(
-                        "t_idle={}s  lru_depth={}  mem_crit={}%  fg_lru_max={}  harvest={}  max_kills={}",
-                        self.config.t_idle_sec, self.config.lru_protect_depth, self.config.mem_critical_percent,
-                        self.config.fg_lru_max_depth, self.config.screen_off_harvest, self.config.max_kills_per_pass
-                    );
-                    format!("{:<12}   {:<12} {:<26} {}", time_str, "CONFIG_RELOAD", "--", detail)
-                },
-                || format!(
-                    r#"{{"ts":{},"event":"config_reload","t_idle_sec":{},"lru_protect_depth":{},"mem_critical_percent":{},"fg_lru_max_depth":{},"screen_off_harvest":{},"max_kills_per_pass":{}}}"#,
-                    now_epoch, self.config.t_idle_sec, self.config.lru_protect_depth, self.config.mem_critical_percent,
-                    self.config.fg_lru_max_depth, self.config.screen_off_harvest, self.config.max_kills_per_pass
-                ),
-            );
+            if first_load {
+                // Held for `run()` (see `startup_record`), which also covers the terminal with
+                // `--no-log`: that record is the only rendering of the *effective* switch, because
+                // the `[CONFIG] Active` line reports the file's `log_enabled` value.
+                self.startup_record = Some((self.config, want_log, now_epoch));
+            } else {
+                // Each rendering stays behind its own closure, so the surface nobody is reading is
+                // never built: the tabular row costs a `localtime_r` and a String on top of the JSON.
+                let cfg = self.config;
+                self.telemetry.emit_with(
+                    || Self::config_reload_tabular(&cfg, want_log, now_epoch),
+                    || Self::config_reload_json(&cfg, want_log, now_epoch),
+                );
+            }
+
+            if !want_log {
+                // Flushed on its way out, so nothing buffered is lost by the close.
+                self.telemetry.set_log_enabled(false);
+            } else {
+                // The startup record is the baseline a post-mortem reads first, so it must not sit
+                // in the 8 KB buffer waiting for an event batch a quiet device never produces:
+                // an unclean stop (SIGKILL, a module upgrade) would lose it with the daemon.
+                self.telemetry.flush();
+            }
         }
+    }
+
+    /// Render the held startup `config_reload` record. Called from `run()` once the terminal table
+    /// header exists, and from [`Self::fatal`] so a daemon that dies during initialisation still
+    /// leaves the baseline behind. Flushed at once rather than waiting for the next event batch: a
+    /// quiet device may never produce one, and `SIGKILL` — how a module upgrade stops the daemon —
+    /// discards whatever is still in the buffer.
+    fn emit_startup_record(&mut self) {
+        let Some((cfg, want_log, ts)) = self.startup_record.take() else {
+            return;
+        };
+        self.telemetry.emit_with(
+            || Self::config_reload_tabular(&cfg, want_log, ts),
+            || Self::config_reload_json(&cfg, want_log, ts),
+        );
+        self.telemetry.flush();
+    }
+
+    /// Tabular rendering of a `config_reload` record: the row for a human reading a terminal,
+    /// built only when there is one. `want_log` is the *effective* switch (config AND not
+    /// `--no-log`), deliberately: a daemon started with `--no-log` still has `log_enabled = true`
+    /// in its config, and a record claiming the log is on while nothing is written answers the one
+    /// question the record exists for incorrectly.
+    fn config_reload_tabular(cfg: &RuntimeConfig, want_log: bool, now_epoch: u64) -> String {
+        let detail = format!(
+            "t_idle={}s  lru_depth={}  mem_crit={}%  fg_lru_max={}  harvest={}  max_kills={}  min_adj={}  log={}",
+            cfg.t_idle_sec,
+            cfg.lru_protect_depth,
+            cfg.mem_critical_percent,
+            cfg.fg_lru_max_depth,
+            cfg.screen_off_harvest,
+            cfg.max_kills_per_pass,
+            cfg.min_oom_score_adj,
+            want_log
+        );
+        format!(
+            "{:<12}   {:<12} {:<26} {}",
+            format_time_hms_ms(now_epoch),
+            "CONFIG_RELOAD",
+            "--",
+            detail
+        )
+    }
+
+    /// NDJSON rendering of a `config_reload` record: the payload for `operations.log`, and for
+    /// stdout under `--json`. Carries every field of [`RuntimeConfig`] plus the effective log
+    /// switch, same `want_log` rule as [`Self::config_reload_tabular`].
+    fn config_reload_json(cfg: &RuntimeConfig, want_log: bool, now_epoch: u64) -> String {
+        format!(
+            r#"{{"ts":{},"event":"config_reload","t_idle_sec":{},"lru_protect_depth":{},"mem_critical_percent":{},"fg_lru_max_depth":{},"screen_off_harvest":{},"max_kills_per_pass":{},"min_oom_score_adj":{},"log_enabled":{}}}"#,
+            now_epoch,
+            cfg.t_idle_sec,
+            cfg.lru_protect_depth,
+            cfg.mem_critical_percent,
+            cfg.fg_lru_max_depth,
+            cfg.screen_off_harvest,
+            cfg.max_kills_per_pass,
+            cfg.min_oom_score_adj,
+            want_log
+        )
     }
 
     fn detect_system_components(&mut self) {
@@ -548,9 +677,7 @@ impl DaemonState {
         {
             Ok(c) => c,
             Err(e) => {
-                let _ = writeln!(stderr(), "[FATAL] Failed to spawn logcat: {}", e);
-                self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
-                std::process::exit(1);
+                self.fatal(format_args!("Failed to spawn logcat: {}", e));
             }
         };
 
@@ -558,9 +685,7 @@ impl DaemonState {
         let raw_fd = logcat_pipe.into_raw_fd();
 
         if let Err(err) = probe_logcat_stream(&mut child, raw_fd) {
-            let _ = writeln!(stderr(), "[FATAL] Logcat pipeline startup probe failed: {}", err);
-            self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
-            std::process::exit(1);
+            self.fatal(format_args!("Logcat pipeline startup probe failed: {}", err));
         }
 
         unsafe {
@@ -573,9 +698,7 @@ impl DaemonState {
             u64: TOKEN_LOGCAT_PIPE,
         };
         if unsafe { libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_ADD, raw_fd, &mut ev) } < 0 {
-            let _ = writeln!(stderr(), "[FATAL] epoll_ctl logcat pipe failed: {}", std::io::Error::last_os_error());
-            self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
-            std::process::exit(1);
+            self.fatal(format_args!("epoll_ctl logcat pipe failed: {}", std::io::Error::last_os_error()));
         }
 
         self.logcat_fd = raw_fd;
@@ -1027,9 +1150,7 @@ impl DaemonState {
                 }
                 if reaped == logcat_pid {
                     if RUNNING.load(Ordering::Relaxed) {
-                        let _ = writeln!(stderr(), "[FATAL] Persistent logcat stream died (reaped via WNOHANG). Exiting.");
-                        self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
-                        std::process::exit(1);
+                        self.fatal(format_args!("Persistent logcat stream died (reaped via WNOHANG). Exiting."));
                     }
                     break;
                 }
@@ -1050,6 +1171,9 @@ impl DaemonState {
             let _ = writeln!(stdout(), "{:<12}   {:<12} {:<26} DETAIL / REASON", "# TIME", "EVENT", "TARGET");
             let _ = writeln!(stdout(), "{}", "-".repeat(80));
         }
+        // The startup configuration record, held since `new()`: emitted here so its row lands under
+        // the header just printed, and on disk for a headless run.
+        self.emit_startup_record();
 
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
         let mut logcat_buf = Vec::with_capacity(4096);
@@ -1069,11 +1193,8 @@ impl DaemonState {
                     }
                     continue;
                 }
-                let _ = writeln!(stderr(), "[FATAL] epoll_wait error: {}", err);
-                self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
-                std::process::exit(1);
+                self.fatal(format_args!("epoll_wait error: {}", err));
             }
-
             self.reap_terminated_children();
 
             for ev in events.iter().take(nfds as usize) {
@@ -1084,9 +1205,7 @@ impl DaemonState {
                     TOKEN_LOGCAT_PIPE => {
                         if revents & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0 {
                             if RUNNING.load(Ordering::Relaxed) {
-                                let _ = writeln!(stderr(), "[FATAL] Logcat pipe HUP/ERR (0x{:x}). Exiting.", revents);
-                                self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
-                                std::process::exit(1);
+                                self.fatal(format_args!("Logcat pipe HUP/ERR (0x{:x}). Exiting.", revents));
                             }
                             break;
                         }
@@ -1123,9 +1242,7 @@ impl DaemonState {
                                 }
                             } else if n == 0 {
                                 if RUNNING.load(Ordering::Relaxed) {
-                                    let _ = writeln!(stderr(), "[FATAL] Logcat pipe EOF. Exiting.");
-                                    self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
-                                    std::process::exit(1);
+                                    self.fatal(format_args!("Logcat pipe EOF. Exiting."));
                                 }
                                 break;
                             } else {
@@ -1136,9 +1253,7 @@ impl DaemonState {
                                     if !RUNNING.load(Ordering::Relaxed) { break; }
                                     continue;
                                 } else {
-                                    let _ = writeln!(stderr(), "[FATAL] Logcat pipe error: {}. Exiting.", err);
-                                    self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
-                                    std::process::exit(1);
+                                    self.fatal(format_args!("Logcat pipe error: {}. Exiting.", err));
                                 }
                             }
                         }
@@ -1265,6 +1380,7 @@ Modes:
 
 Options:
   --json           Emit raw NDJSON to stdout instead of tabular columnar format
+  --no-log         Never write operations.log (overrides log_enabled in daemon.conf)
   -h, --help       Print this help message"#
     );
 }
@@ -1272,12 +1388,14 @@ Options:
 fn main() {
     let mut mode = None;
     let mut json_stdout = false;
+    let mut no_log = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--act" => mode = Some(true),
             "--observe" => mode = Some(false),
             "--json" => json_stdout = true,
+            "--no-log" => no_log = true,
             "-h" | "--help" => return print_help(),
             other => { let _ = writeln!(stderr(), "[WARN] Unknown argument: {}", other); }
         }
@@ -1288,8 +1406,15 @@ fn main() {
         return print_help();
     };
 
-    let _ = writeln!(stdout(), "=== mini-lmk daemon ===");
-    DaemonState::new(act_mode, json_stdout).run();
+    // A `--json` stdout is a machine contract: the banner would be the one non-NDJSON line an
+    // axcore pipeline has to skip. A redirected stdout deserves the same treatment, because every
+    // consumer of it (`scripts/benchmark.sh`, an operator piping the supervisor into a file) wants
+    // the progress banners and not the event table, so the human banner follows the same `isatty(1)`
+    // rule as the table it introduces.
+    if !json_stdout && telemetry::stdout_is_tty() {
+        let _ = writeln!(stdout(), "=== mini-lmk daemon ===");
+    }
+    DaemonState::new(act_mode, json_stdout, no_log).run();
 }
 
 #[cfg(test)]
@@ -1383,6 +1508,126 @@ mod tests {
     }
 
     #[test]
+    fn test_config_reload_renderings_report_effective_log_switch() {
+        // log_enabled=true in the config, but --no-log means nothing is written. The record must
+        // say false: it is the only place an operator learns what the daemon is doing with the log.
+        let cfg = RuntimeConfig {
+            log_enabled: true,
+            ..RuntimeConfig::default()
+        };
+        let tabular = DaemonState::config_reload_tabular(&cfg, false, 1_700_000_000_000);
+        let json = DaemonState::config_reload_json(&cfg, false, 1_700_000_000_000);
+        assert!(json.ends_with(r#""log_enabled":false}"#), "{json}");
+        assert!(tabular.contains("log=false"), "{tabular}");
+        assert!(json.contains(r#""min_oom_score_adj":900"#), "{json}");
+
+        // Every tunable in RuntimeConfig must appear in the record, or a change to it is
+        // undocumentable by the event that exists to document changes. Counts, not just presence:
+        // a silently-added ninth field would otherwise pass unnoticed.
+        // 10 = ts + event + the 8 RuntimeConfig fields.
+        assert_eq!(json.matches(':').count(), 10, "one per key: {json}");
+        assert_eq!(tabular.matches('=').count(), 8, "{tabular}");
+    }
+
+    /// A config tree the test owns. `ConfigPaths::get()` caches `$MODPATH` for the whole process and
+    /// otherwise falls back to `/data/local/tmp/mlmk`, so an ambient `daemon.conf` there (which the
+    /// device scratch dir does contain) would decide what these tests see.
+    fn isolated_paths(tag: &str) -> (ConfigPaths, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("mlmk_cfg_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&base);
+        let config_dir = base.join("config");
+        let logs_dir = base.join("logs");
+        std::fs::create_dir_all(&config_dir).expect("test config dir");
+        std::fs::create_dir_all(&logs_dir).expect("test logs dir");
+        let owned = |p: &std::path::Path| p.to_string_lossy().to_string();
+        (
+            ConfigPaths {
+                base_dir: owned(&base),
+                config_dir: owned(&config_dir),
+                logs_dir: owned(&logs_dir),
+                config_file: owned(&config_dir.join("daemon.conf")),
+                exclude_file: owned(&config_dir.join("exclude.list")),
+                games_file: owned(&config_dir.join("games.list")),
+                operations_log: owned(&logs_dir.join("operations.log")),
+            },
+            base,
+        )
+    }
+
+    #[test]
+    fn test_reload_applies_the_daemon_conf_it_reads() {
+        // The startup announcement is only meaningful if the reload actually read the file, and
+        // that line has no other protection: deleting it leaves every other test green because the
+        // daemon simply keeps its defaults and still announces them. So assert the record carries
+        // values a file supplied, not values the defaults happen to have.
+        let (mut d, log) = daemon_for_test("reload_file", 1_700_000_000_000);
+        let (paths, base) = isolated_paths("reload_file");
+        std::fs::write(
+            &paths.config_file,
+            "t_idle_sec = 300\nlru_protect_depth = 6\nmax_kills_per_pass = 5\n",
+        )
+        .expect("write daemon.conf");
+
+        d.reload_configs_from(&paths);
+        d.emit_startup_record();
+
+        assert_eq!(
+            d.config.t_idle_sec, 300,
+            "the file must reach the live config"
+        );
+        assert_eq!(d.config.lru_protect_depth, 6);
+        assert_eq!(d.config.max_kills_per_pass, 5);
+        let text = std::fs::read_to_string(&log).expect("the reload must reach the log");
+        assert!(text.contains(r#""t_idle_sec":300"#), "{text}");
+        assert!(text.contains(r#""lru_protect_depth":6"#), "{text}");
+        assert!(text.contains(r#""max_kills_per_pass":5"#), "{text}");
+
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_first_config_load_is_announced_even_without_a_change() {
+        // A headless daemon prints `[CONFIG] Active: ...` to a stdout that service.sh sends to
+        // /dev/null, so operations.log is the only place the applied configuration can appear. It
+        // has to appear even when daemon.conf is absent or matches the defaults, and it has to
+        // reach the disk rather than wait in the 8 KB buffer for an event batch this quiet run
+        // never gets. It is emitted by emit_startup_record(), which run() calls only after the
+        // terminal table header, so the row never lands above the header it belongs to.
+        let (mut d, log) = daemon_for_test("announce", 1_700_000_000_000);
+        let (paths, base) = isolated_paths("announce");
+        d.config = RuntimeConfig {
+            t_idle_sec: 180,
+            log_enabled: true,
+            ..RuntimeConfig::default()
+        };
+
+        d.reload_configs_from(&paths);
+        // What run() does once the terminal table header exists. No explicit flush here on purpose:
+        // the record must already be on disk when emit_startup_record() returns.
+        d.emit_startup_record();
+        let text = std::fs::read_to_string(&log).expect("first load must be on disk, not buffered");
+        assert_eq!(
+            text.matches(r#""event":"config_reload""#).count(),
+            1,
+            "exactly one startup record: {text}"
+        );
+        assert!(text.ends_with('\n'), "record is a complete line: {text}");
+
+        // Change detection is not simply gone: a second load that moves nothing adds nothing.
+        d.reload_configs_from(&paths);
+        d.telemetry.flush();
+        let again = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            again.matches(r#""event":"config_reload""#).count(),
+            1,
+            "an unchanged reload must stay silent"
+        );
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn test_ams_protected_alive_apps_lifecycle() {
         let mut alive_apps: FastMap<String, u64> = FastMap::default();
         let old_time = 1_000_000u64;
@@ -1466,12 +1711,18 @@ mod tests {
 
     /// Test-only `DaemonState` with inert descriptors and a throwaway telemetry file,
     /// so the anchor-rebasing paths can be exercised without spawning `logcat`.
-    fn daemon_for_test(tag: &str, bootstrap_epoch: u64) -> DaemonState {
+    fn daemon_for_test(tag: &str, bootstrap_epoch: u64) -> (DaemonState, std::path::PathBuf) {
         let log_path =
             std::env::temp_dir().join(format!("mlmk_test_{}_{}.log", std::process::id(), tag));
-        DaemonState {
+        // The sink opens (and thereby creates) this path, so a leftover from an earlier run must
+        // go first: unlinking afterwards would leave the writer appending to a deleted inode.
+        let _ = std::fs::remove_file(&log_path);
+        let daemon = DaemonState {
             config: RuntimeConfig::default(),
             json_stdout: false,
+            no_log_cli: false,
+            config_announced: false,
+            startup_record: None,
             alive_apps: FastMap::default(),
             pid_to_pkg: FastMap::default(),
             pkg_to_pids: FastMap::default(),
@@ -1481,7 +1732,7 @@ mod tests {
             games: FastSet::default(),
             dynamic_exclusions: FastSet::default(),
             fg_lru: VecDeque::default(),
-            telemetry: TelemetrySink::new(&log_path.to_string_lossy(), false),
+            telemetry: TelemetrySink::new(&log_path.to_string_lossy(), false, true),
             logcat_child: None,
             current_fg: None,
             screen_on_start: Some(bootstrap_epoch),
@@ -1498,7 +1749,8 @@ mod tests {
             screen_on: true,
             is_gaming: false,
             act_mode: true,
-        }
+        };
+        (daemon, log_path)
     }
 
     #[test]
@@ -1509,7 +1761,7 @@ mod tests {
         let boot_ms = 1_234_567_890_000u64; // 2009, below RTC_SYNC_FLOOR_MS
         let first_event_ms = 1_777_998_045_123u64; // post-sync
         let idle = "com.example.idle";
-        let mut d = daemon_for_test("bootstep", boot_ms);
+        let (mut d, _) = daemon_for_test("bootstep", boot_ms);
         d.alive_apps.insert(idle.into(), boot_ms);
         d.recent_deaths.insert("com.example.dead".into(), boot_ms);
 
@@ -1524,7 +1776,7 @@ mod tests {
         assert_eq!(d.recent_deaths["com.example.dead"], first_event_ms);
 
         // A correct boot clock followed by an ordinary quiet gap stays untouched.
-        let mut d2 = daemon_for_test("bootsync", first_event_ms);
+        let (mut d2, _) = daemon_for_test("bootsync", first_event_ms);
         d2.alive_apps.insert(idle.into(), first_event_ms);
         let later = first_event_ms + 3_600_000;
         let jump2 = DaemonState::clock_jump_ms(d2.last_event_epoch, later);

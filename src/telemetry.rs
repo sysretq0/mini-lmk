@@ -95,23 +95,45 @@ pub struct SessionStats {
 
 const ROTATION_THRESHOLD_BYTES: usize = 512 * 1024; // 512 KB
 
+/// Whether fd 1 is a terminal. `TelemetrySink` caches the answer at construction
+/// because consulting it per event would be a syscall per event; callers that run
+/// before a sink exists (the startup banner) call it directly, costing one syscall
+/// per process. `--json` overrides the answer either way, because that mode's
+/// stdout is a machine contract rather than a human surface.
+#[inline]
+pub fn stdout_is_tty() -> bool {
+    (unsafe { libc::isatty(libc::STDOUT_FILENO) }) == 1
+}
+
 pub struct TelemetrySink {
+    /// The single source of truth for "file logging is on": `Some` means records are being
+    /// appended, `None` means the log is switched off (`log_enabled = false` or `--no-log`) or
+    /// the file could not be opened. Deliberately not a separate `bool` + `Option` pair, which
+    /// could disagree with each other.
     writer: Option<BufWriter<File>>,
     bytes_written: usize,
     log_path: String,
     pub json_stdout: bool,
+    /// Whether stdout is a terminal, i.e. whether the columnar table has a reader. Cached at
+    /// construction because consulting `isatty` per event would be a syscall per event; `--json`
+    /// overrides it either way, because that mode's stdout is a machine contract rather than a
+    /// human surface.
     stdout_tty: bool,
 }
 
 impl TelemetrySink {
-    pub fn new(log_path: &str, json_stdout: bool) -> Self {
-        let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
-        Self::with_stdout(log_path, json_stdout, tty)
+    pub fn new(log_path: &str, json_stdout: bool, log_enabled: bool) -> Self {
+        Self::with_stdout(log_path, json_stdout, log_enabled, stdout_is_tty())
     }
 
     /// `stdout_tty` is a parameter rather than an `isatty()` call inside [`Self::new`] so tests
     /// stay deterministic: under `cargo test` fd 1 is a pipe, never a terminal.
-    pub fn with_stdout(log_path: &str, json_stdout: bool, stdout_tty: bool) -> Self {
+    pub fn with_stdout(
+        log_path: &str,
+        json_stdout: bool,
+        log_enabled: bool,
+        stdout_tty: bool,
+    ) -> Self {
         let mut current_bytes = 0;
         if let Ok(meta) = fs::metadata(log_path) {
             current_bytes = meta.len() as usize;
@@ -125,19 +147,54 @@ impl TelemetrySink {
             stdout_tty,
         };
 
-        if sink.bytes_written >= ROTATION_THRESHOLD_BYTES {
-            sink.rotate();
-        } else {
-            sink.open_file();
+        if log_enabled {
+            sink.open_log();
         }
 
         sink
     }
 
-    /// Whether nothing at all will be rendered for this event: no log file, no `--json`
-    /// contract, and no terminal to read the tabular column. The log file is the deciding
-    /// factor for a background daemon — `service.sh` redirects stdout to `/dev/null`, so
-    /// `operations.log` must keep receiving records even though no closure output is printed.
+    /// Apply the `log_enabled` state (`daemon.conf`, `--no-log`). Disabling closes the file after
+    /// flushing, so a disabled daemon leaves no `operations.log` behind and writes no bytes; a
+    /// disabled-then-re-enabled log resumes in append mode at the same rotation threshold.
+    /// stdout behaviour is independent: `--json` and the terminal table keep working.
+    ///
+    /// An open writer *is* the enabled state, so re-enabling after a failed open retries it here
+    /// rather than treating the daemon as already logged.
+    pub fn set_log_enabled(&mut self, on: bool) {
+        if on == self.writer.is_some() {
+            return;
+        }
+        if on {
+            self.open_log();
+        } else {
+            self.flush();
+            self.writer = None;
+        }
+    }
+
+    /// Open the log for appending, rotating first if the existing file is already at the limit.
+    ///
+    /// The limit is re-read from the inode rather than trusted from `bytes_written`: the cache only
+    /// moves while the daemon holds the file, so an `operations.log` that grew (or was replaced)
+    /// while the log was switched off would otherwise be appended past the cap, and a truncated one
+    /// would be rotated early.
+    fn open_log(&mut self) {
+        self.bytes_written = fs::metadata(&self.log_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        if self.bytes_written >= ROTATION_THRESHOLD_BYTES {
+            self.rotate();
+        } else {
+            self.open_file();
+        }
+    }
+
+    /// Whether nothing at all will be rendered for this event: no open log file (either
+    /// `log_enabled = false` or the file could not be opened), no `--json` contract, and no
+    /// terminal to read the tabular column. The log file is the deciding factor for a background
+    /// daemon -- `service.sh` redirects stdout to `/dev/null`, so `operations.log` must keep
+    /// receiving records even though no closure output is printed.
     #[inline]
     pub fn silent(&self) -> bool {
         self.writer.is_none() && !self.json_stdout && !self.stdout_tty
@@ -165,7 +222,9 @@ impl TelemetrySink {
         self.writer = file.map(|f| BufWriter::with_capacity(8192, f));
     }
 
-    pub fn rotate(&mut self) {
+    /// Rename the current log to `<path>.old` and start a fresh file. Only ever called when the
+    /// log is meant to be open, so it always reopens; the disabled case cannot reach it.
+    fn rotate(&mut self) {
         self.flush();
         self.writer = None;
         let old_path = format!("{}.old", self.log_path);
@@ -179,16 +238,18 @@ impl TelemetrySink {
         self.bytes_written = 0;
     }
 
-    /// Buffer the record; do **not** flush. The reactor calls [`Self::flush`] once per
-    /// `epoll_wait` batch and before every `exit`, so a burst of events costs one `write(2)`
-    /// instead of one per line. Public so `benches/microbench.rs` can time the real write path.
+    /// Buffer the record; do **not** flush. See [`Self::flush`]. Public so
+    /// `benches/microbench.rs` can time the real write path.
     pub fn write_to_log(&mut self, line: &str) {
+        if self.writer.is_none() {
+            return; // logging switched off, or the file could not be opened
+        }
         let line_len = line.len() + 1;
         if self.bytes_written + line_len >= ROTATION_THRESHOLD_BYTES {
             self.rotate();
         }
         if let Some(ref mut w) = self.writer {
-            if writeln!(w, "{}", line).is_ok() {
+            if writeln!(w, "{line}").is_ok() {
                 self.bytes_written += line_len;
             }
         }
@@ -205,19 +266,31 @@ impl TelemetrySink {
         if self.silent() {
             return;
         }
-        let json_line = make_json();
+        // JSON is the log's payload, and stdout's payload under `--json`. With neither
+        // interested there is nothing to format; `write_to_log` drops the empty line on the
+        // floor because its writer is `None`.
+        let json_line = if self.json_stdout || self.writer.is_some() {
+            make_json()
+        } else {
+            String::new()
+        };
         if self.json_stdout {
             // `--json` stdout is a machine contract (axcore, a pipe), so it holds regardless
             // of whether fd 1 is a terminal.
-            let _ = writeln!(stdout(), "{}", json_line);
-        } else if self.stdout_tty {
-            // Tabular rendering costs a `localtime_r` and a second String; it exists for a
-            // human reading a terminal, so that is the only place it runs.
+            let _ = writeln!(stdout(), "{json_line}");
+        } else if self.tabular_stdout() {
+            // Tabular rendering costs a `localtime_r` and a String; it exists for a human
+            // reading a terminal, so that is the only place it runs.
             let _ = writeln!(stdout(), "{}", make_tabular());
         }
         self.write_to_log(&json_line);
     }
 
+    /// Push buffered records to the log file. The reactor calls this once per
+    /// `epoll_wait` batch and before every `exit`, so a burst of events costs one
+    /// `write(2)` instead of one per line. A batch that emitted nothing costs
+    /// nothing either: an empty `BufWriter::flush` and `File::flush` perform no
+    /// syscall, so no dirty flag is needed to keep quiet windows write-free.
     pub fn flush(&mut self) {
         let _ = stdout().flush();
         if let Some(ref mut w) = self.writer {
@@ -261,7 +334,7 @@ mod tests {
         let _ = fs::remove_file(&old_path_str);
 
         {
-            let mut sink = TelemetrySink::with_stdout(path_str, false, true);
+            let mut sink = TelemetrySink::with_stdout(path_str, false, true, true);
             sink.emit_with(
                 || "12:00:00.000   FG_SWITCH    com.test                   prev=--".to_string(),
                 || r#"{"event":"fg_switch"}"#.to_string(),
@@ -321,12 +394,13 @@ mod tests {
         let cases = [
             (true, true, true, false, true),     // --json on a terminal
             (false, true, true, true, true),     // interactive: columnar row plus file record
+            (false, true, false, true, false),   // human turned the log off: table only
             (false, false, true, false, true),   // service.sh: the file record is all that runs
             (false, false, false, false, false), // nowhere to write: both closures skipped
         ];
         for (json, tty, log_ok, want_tabular, want_json) in cases {
             let path = if log_ok { path_str } else { dead_path };
-            let mut sink = TelemetrySink::with_stdout(path, json, tty);
+            let mut sink = TelemetrySink::with_stdout(path, json, true, tty);
             let (mut tabular, mut made_json) = (false, false);
             sink.emit_with(
                 || {
@@ -364,7 +438,7 @@ mod tests {
         let _ = fs::remove_file(&tmp_path);
 
         // No --json, no terminal, but the log file IS openable: the record must still be logged.
-        let mut sink = TelemetrySink::with_stdout(path_str, false, false);
+        let mut sink = TelemetrySink::with_stdout(path_str, false, true, false);
         assert!(!sink.silent(), "an open log file is an output");
         let mut tabular_called = false;
         sink.emit_with(
@@ -381,5 +455,117 @@ mod tests {
             .contains(r#"{"event":"test"}"#));
 
         let _ = fs::remove_file(&tmp_path);
+    }
+
+    /// `log_enabled = false` in daemon.conf and `--no-log` on the CLI share one mechanism: the
+    /// sink closes the file. stdout rendering stays independent, so a run attached to a terminal
+    /// keeps its table and a `--json` stream keeps its records.
+    #[test]
+    fn test_log_disable_closes_file_and_reenable_resumes() {
+        let mut tmp_path = std::env::temp_dir();
+        tmp_path.push("mini_lmk_disabled_test.log");
+        let path_str = tmp_path.to_str().unwrap();
+        let _ = fs::remove_file(&tmp_path);
+
+        let mut sink = TelemetrySink::with_stdout(path_str, false, false, true);
+        assert!(sink.writer.is_none(), "a disabled log is never opened");
+        assert!(!sink.silent(), "a terminal is still an output");
+        let mut rendered = false;
+        sink.emit_with(
+            || {
+                rendered = true;
+                "row".to_string()
+            },
+            || r#"{"event":"kill"}"#.to_string(),
+        );
+        assert!(
+            rendered,
+            "the terminal table is independent of the log switch"
+        );
+        assert!(!tmp_path.exists(), "a disabled daemon creates no log file");
+
+        sink.set_log_enabled(true);
+        sink.emit_with(
+            || "row".to_string(),
+            || r#"{"event":"fg_switch"}"#.to_string(),
+        );
+        sink.set_log_enabled(false); // flushes the buffer on its way out
+        assert_eq!(
+            fs::read_to_string(&tmp_path).unwrap(),
+            "{\"event\":\"fg_switch\"}\n",
+            "the record buffered before disabling must survive the close"
+        );
+
+        // Dropped while disabled: prove they survive no later reopen, by reopening and flushing.
+        sink.emit_with(
+            || "row".to_string(),
+            || r#"{"event":"respawn"}"#.to_string(),
+        );
+        sink.set_log_enabled(true);
+        sink.emit_with(|| "row".to_string(), || r#"{"event":"late"}"#.to_string());
+        sink.set_log_enabled(false); // flushes the buffer on its way out
+        assert_eq!(
+            fs::read_to_string(&tmp_path).unwrap(),
+            "{\"event\":\"fg_switch\"}\n{\"event\":\"late\"}\n",
+            "the event emitted while the log was closed must not reappear when it reopens"
+        );
+
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn test_reopen_rotates_a_log_that_grew_while_disabled() {
+        // `bytes_written` cannot move while the writer is closed, so a size cached at open time
+        // would let an `operations.log` that grew in the meantime be appended past the cap.
+        // Re-enabling must re-read the inode and rotate first.
+        let pid = std::process::id();
+        let tmp_path = std::env::temp_dir().join(format!("mlmk_test_{pid}_grow.log"));
+        let old_path = format!("{}.old", tmp_path.to_string_lossy());
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(&old_path);
+
+        let mut sink = TelemetrySink::with_stdout(&tmp_path.to_string_lossy(), false, true, true);
+        sink.emit_with(|| "row".to_string(), || r#"{"event":"before"}"#.to_string());
+        sink.set_log_enabled(false);
+        {
+            let mut grower = OpenOptions::new().append(true).open(&tmp_path).unwrap();
+            grower.write_all(&[b'x'; 600 * 1024]).unwrap();
+        }
+
+        sink.set_log_enabled(true);
+        sink.emit_with(|| "row".to_string(), || r#"{"event":"after"}"#.to_string());
+        sink.flush();
+
+        let rotated = fs::metadata(&old_path).expect("re-enabling an oversized log must rotate it");
+        assert!(
+            rotated.len() >= 600 * 1024,
+            "the rotated file must carry what arrived while we were not writing: {}",
+            rotated.len()
+        );
+        assert_eq!(
+            fs::read_to_string(&tmp_path).unwrap(),
+            "{\"event\":\"after\"}\n",
+            "the live file starts empty after the rotation"
+        );
+
+        // And the other direction: a shrunk or deleted file must not be rotated early.
+        sink.set_log_enabled(false);
+        fs::write(&tmp_path, b"").unwrap();
+        sink.set_log_enabled(true);
+        sink.emit_with(|| "row".to_string(), || r#"{"event":"fresh"}"#.to_string());
+        sink.flush();
+        assert_eq!(
+            fs::read_to_string(&tmp_path).unwrap(),
+            "{\"event\":\"fresh\"}\n",
+            "a truncated log must be appended to, not rotated away"
+        );
+        assert_eq!(
+            fs::metadata(&old_path).unwrap().len(),
+            rotated.len(),
+            "no second rotation"
+        );
+
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(&old_path);
     }
 }

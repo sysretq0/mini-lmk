@@ -31,9 +31,14 @@ if [ ! -x "$BIN" ] && ! command -v "$BIN" >/dev/null 2>&1; then
     exit 1
 fi
 
-MODE="${1:---act}"
+# Forward every argument, not just the first. The mode flag is only one of them: keeping `$1`
+# alone would silently swallow `--json` and `--no-log`, and the daemon warns about nothing it
+# never received. With no arguments at all the historical default (`--act`) still applies.
+if [ "$#" -eq 0 ]; then
+    set -- --act
+fi
 
 while true; do
-    "$BIN" "$MODE"
+    "$BIN" "$@"
     sleep 2
 done
