@@ -333,9 +333,9 @@ fi
 if [ "$RUN_MICRO" -eq 1 ]; then
     if [ -x "$DEFAULT_MICROBENCH" ]; then
         echo ""
-        "$DEFAULT_MICROBENCH" -n 10000 --dumpsys-iters 30
+        "$DEFAULT_MICROBENCH" -n 10000
     elif [ -x "./microbench" ]; then
         echo ""
-        ./microbench -n 10000 --dumpsys-iters 30
+        ./microbench -n 10000
     fi
 fi

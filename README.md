@@ -2,7 +2,7 @@
 
 An event-driven userspace memory manager for Android 7.0+ (API 24+) running under Android shell privileges (UID 2000, non-root).
 
-`mini-lmk` preempts kernel direct-reclaim thrashing and native `lmkd` stalls by proactively evicting stale background applications during foreground transition animations and background spawn events. Operating strictly via a single-threaded 2-file-descriptor `epoll` reactor, it maintains an operational footprint of **~1.12 MB PSS** with **0% idle CPU utilization**.
+`mini-lmk` preempts kernel direct-reclaim thrashing and native `lmkd` stalls by proactively evicting stale background applications during foreground transition animations and background spawn events. Operating strictly via a single-threaded 2-file-descriptor `epoll` reactor, it maintains an operational footprint of **~1.11 MB PSS** (P50 1,109 kB, see [Verified Device Performance](#verified-device-performance)) with **0 idle CPU wakeups** between events.
 
 ---
 
@@ -10,7 +10,9 @@ An event-driven userspace memory manager for Android 7.0+ (API 24+) running unde
 
 * **Rootless / Shell-Privileged:** Operates under standard Android shell permissions (UID `2000`, `u:r:shell:s0` via ADB or Shizuku). Requires zero root, KernelSU, Magisk, or custom SELinux modifications while retaining access to the framework's `cmd activity` IPC interface and `logcat` event buffers.
 * **Stack-Buffered Tokenizer & Procfs Readers:** Parses incoming logcat event lines and `/proc` metrics (`statm`, `meminfo`, `oom_score_adj`) using fixed stack-allocated buffers and string slicing, avoiding heap allocations in the log tokenizing and procfs query paths.
-* **Transition-Triggered Eviction:** Reaping evaluations are event-driven, triggered by foreground activity switches (`wm_resume_activity` / `am_resume_activity`) and background process creations (`am_proc_start`) rather than periodic polling timers.
+* **Event-Sourced Timekeeping (Zero Clock Syscalls per Event):** Consumes `logcat -b events -v epoch` and derives `now` from the framework event's own millisecond timestamp, so no `clock_gettime` is sampled per dispatched event and telemetry `ts` is exactly aligned with Activity Manager event time. Idle-age, LRU, and respawn math runs entirely on `u64` epoch milliseconds (line format and clock-step semantics: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §1.3, §2.3).
+* **Wall-Clock Jump Compensation:** A `clock_jump_ms` detector distinguishes real `settimeofday()`/NTP steps from ordinary quiet gaps between events, and shifts every stored anchor (`alive_apps`, `recent_deaths`, screen-state, game-session, session-start) by the same delta, so elapsed ages survive the correction without a spurious reap pass; the detector is seeded from the bootstrap clock read, so the RTC-to-NTP step is caught on the first event.
+* **Transition-Triggered Eviction:** Reaping evaluations are event-driven, triggered by foreground activity switches (`wm_resume_activity` / `am_resume_activity`), background process creations (`am_proc_start`), and Doze light-idle steps (`device_idle_light_step`) rather than periodic polling timers.
 * **Background Spawn Triggering:** Intercepts background process creation (`am_proc_start`) while ignoring foreground task launches, resolving single-app inactivity deadlocks during extended stationary sessions without synthetic polling timers.
 * **Non-Blocking Asynchronous Reaping:** Dispatches eviction commands (`cmd activity kill --user all <pkg>`) asynchronously via the standard library (`std::process::Command::spawn()`) and reaps child processes non-blocking (`libc::waitpid(-1, ..., WNOHANG)`), preventing subprocess execution from blocking the epoll reactor.
 * **Fail-Closed System Safety:** Index-only cold boot discovery and strict `uid >= 10000` guards guarantee low-UID system daemons and platform services are never terminated.
@@ -31,10 +33,11 @@ An event-driven userspace memory manager for Android 7.0+ (API 24+) running unde
               │                           │
               ▼                           ▼
      [TOKEN_LOGCAT_PIPE]           [TOKEN_INOTIFY]
-    (logcat -b events -v tag)     (<base>/config/)
+    (logcat -b events -v epoch)   (<base>/config/)
               │                           │
               ▼                           ▼
-      Text Event Parser          Hot-Reload Configs
+ Epoch + Event Parser            Hot-Reload Configs
+ (zero-copy, no clock syscall)
               │
     ┌─────────┴────────────────────────────────┐
     │                                          │
@@ -61,7 +64,7 @@ Sort Candidates Descending by RSS (/proc/<pid>/statm)
     │
     └── NO:  Dispatch: cmd activity kill --user all <pkg>
              ├── Immediately evicts package from alive_apps (prevents duplicate kills)
-             └── Retains pid_to_pkg mappings (enables attributing am_proc_died telemetry)
+             └── Retains pid_to_pkg mappings (async am_proc_died consumes them for state cleanup and respawn detection)
 ```
 
 ---
@@ -86,8 +89,8 @@ mini-lmk/
 ├── src/
 │   ├── config.rs            # Runtime configuration parsing (daemon.conf)
 │   ├── hasher.rs            # In-tree 64-bit FNV-1a hasher (zero-dependency)
-│   ├── parser.rs            # Stack-buffered event log tokenizer and fallbacks
-│   ├── procfs.rs            # Stack-buffered /proc readers (statm, meminfo, cmdline)
+│   ├── parser.rs            # Zero-copy epoch logcat dispatcher and event fallbacks
+│   ├── procfs.rs            # Stack-buffered /proc readers (statm, meminfo, oom_score_adj)
 │   ├── telemetry.rs         # Dual-output TelemetrySink with 512 KB log rotation
 │   └── main.rs              # Epoll reactor, state machine, and eviction pipeline
 ├── Cargo.lock               # Deterministic dependency manifest
@@ -96,14 +99,14 @@ mini-lmk/
 ├── LICENSE                  # GNU General Public License v3.0
 ├── package.sh               # Multi-ABI AxManager plugin packaging script
 ├── README.md                # Project documentation and quickstart
-└── run-daemon.sh            # Target hardware supervisor loop
+└── run-daemon.sh            # Module supervisor loop (invoked by the installer's service.sh)
 ```
 
 ---
 
 ## Configuration
 
-Configuration files reside under `<base>/config/` (dynamically resolved to `$MODPATH/mlmk/config/` in AxManager, or `/data/local/tmp/mlmk/config/` for standalone ADB execution) and are reloaded via `inotify` when modified:
+Configuration files reside under `<base>/config/` (dynamically resolved to `$MODPATH/mlmk/config/` in AxManager, or `/data/local/tmp/mlmk/config/` for standalone ADB execution) and are reloaded via `inotify` when modified. The installer creates `exclude.list` and `games.list` (both empty); `daemon.conf` is **not** shipped — until you create it, the compiled defaults in the table below are in effect, and an unreadable file silently keeps them.
 
 ### `daemon.conf`
 
@@ -142,7 +145,7 @@ min_oom_score_adj=900
 | `mem_critical_percent` | `10` | `u64` (%) | RAM watermark triggering emergency idle bypass (`T_idle = 10s` grace window). |
 | `fg_lru_max_depth` | `10` | `usize` | Maximum size of the foreground LRU ring buffer. |
 | `screen_off_harvest` | `true` | `bool` | Accelerates idle decay and narrows LRU depth to 1 during screen-off Doze cycles. |
-| `max_kills_per_pass` | `2` (auto-scaled) | `1`–`4` | Eviction burst cap. Scaled by RAM: `<=4.5GB` -> 4, `4.5-8.5GB` -> 2, `>8.5GB` -> 1. |
+| `max_kills_per_pass` | `2` (auto-scaled) | `usize` >= 1 | Eviction burst cap. Default scales by RAM: `<=4.5GB` -> 4, `4.5-8.5GB` -> 2, `>8.5GB` -> 1. |
 | `min_oom_score_adj` | `900` | `500`–`900` | Minimum OOM score required for eviction. `900` protects services; `500` reclaims background services. |
 
 ### `exclude.list`
@@ -182,7 +185,7 @@ cargo build --release --target aarch64-linux-android
 cargo test --target $(rustc -vV | sed -n 's/host: //p')
 ```
 
-The release profile compiles with `opt-level = "z"`, fat LTO, symbol stripping, and single codegen units, generating a stripped native ELF under 400 KB.
+The release profile compiles with `opt-level = "z"`, fat LTO, `panic = "abort"`, symbol stripping, and single codegen units. Measured stripped ELF sizes per ABI are listed in `docs/ARCHITECTURE.md` §1 (296–446 KB across the four targets).
 
 ---
 
@@ -193,8 +196,7 @@ Deploy to standard Android shell (`adb shell` / UID 2000):
 ```bash
 # 1. Push binary and initialize directory structure (empty lists out of the box)
 adb push target/aarch64-linux-android/release/mini-lmk /data/local/tmp/mini-lmk
-adb push run-daemon.sh /data/local/tmp/mlmk/run-daemon.sh
-adb shell "chmod +x /data/local/tmp/mini-lmk /data/local/tmp/mlmk/run-daemon.sh"
+adb shell "chmod +x /data/local/tmp/mini-lmk"
 adb shell "mkdir -p /data/local/tmp/mlmk/config /data/local/tmp/mlmk/logs"
 adb shell "touch /data/local/tmp/mlmk/config/exclude.list /data/local/tmp/mlmk/config/games.list"
 
@@ -204,9 +206,11 @@ adb shell /data/local/tmp/mini-lmk --observe
 # 3. Run in active enforcement mode
 adb shell /data/local/tmp/mini-lmk --act
 
-# 4. Run via background supervisor loop
-adb shell "nohup /data/local/tmp/mlmk/run-daemon.sh --act > /data/local/tmp/mlmk/logs/stdout.log 2>&1 &"
+# 4. Run under a background supervisor loop (restarts the daemon every 2s after an exit)
+adb shell "nohup sh -c 'while /data/local/tmp/mini-lmk --act; do sleep 2; done' > /data/local/tmp/mlmk/logs/stdout.log 2>&1 &"
 ```
+
+> **Note on `run-daemon.sh`:** this supervisor script targets the installed module layout only — it resolves the binary from `$MODPATH/system/bin/mini-lmk` or `$MODPATH/bin/<abi>/mini-lmk` and exports `MODPATH` (which also moves the daemon's base directory to `<script dir>/mlmk`). Copied next a bare binary it exits `binary not found`; use the inline loop above for standalone ADB runs.
 
 ### Command-Line Arguments
 
@@ -236,7 +240,7 @@ Live operations are formatted into aligned columns on standard output:
 14:25:40.201   BG_SUMMARY   --                         interval=144s  spawns=5  deaths=4  rss_delta=+12MB
 ```
 
-All operations are simultaneously written to `<base>/logs/operations.log` in structured NDJSON format (including `oom_score_adj`, `ams_protected`, and `spawn_skipped` fields), rotating to `operations.log.old` upon exceeding 512 KB.
+All operations are simultaneously written to `<base>/logs/operations.log` in structured NDJSON format (including the event-sourced `ts` epoch-millisecond timestamp, `oom_score_adj`, `ams_protected`, and `spawn_skipped` fields), rotating to `operations.log.old` upon exceeding 512 KB.
 
 ---
 
@@ -248,7 +252,7 @@ Profiled on physical target hardware (Android 14 API 34, Linux kernel 5.10, aarc
 
 Evaluated via the standalone, criterion-free `benches/microbench.rs` harness across 1,000 warm-up cycles and 10,000 timed iterations:
 
-| Target / Operation | Mechanism / Scope | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean | CFS Preemptions |
+| Target / Operation | Mechanism / Scope | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean | Flagged Preemption Samples |
 |---|---|---|---|---|---|---|---|---|---|
 | `procfs::read_oom_score_adj` | self, hot cache | 10,000 | 2.85 µs | **3.31 µs** | 10.69 µs | 14.15 µs | 531.69 µs | 4.32 µs | 1 |
 | `procfs::read_oom_score_adj` | multi-PID pool (cold) | 10,000 | 4.69 µs | **8.69 µs** | 23.38 µs | 38.15 µs | 999.08 µs | 11.72 µs | 3 |
@@ -256,14 +260,13 @@ Evaluated via the standalone, criterion-free `benches/microbench.rs` harness acr
 | `procfs::read_statm_rss_kb` | multi-PID pool (cold) | 10,000 | 5.00 µs | **6.23 µs** | 10.46 µs | 14.77 µs | 450.38 µs | 7.07 µs | 0 |
 | `procfs::read_meminfo_kb` | `/proc/meminfo` | 10,000 | 7.69 µs | **8.00 µs** | 9.46 µs | 12.62 µs | 377.54 µs | 8.50 µs | 0 |
 | `telemetry::FormattedTime` | Stack buffer timestamp | 10,000 | 76.0 ns | **307.0 ns** | 308.0 ns | 308.0 ns | 2.54 µs | 261.3 ns | 0 |
-| `Instant::now` (Overhead) | Measurement baseline | 10,000 | 0.0 ns | **231.0 ns** | 385.0 ns | 539.0 ns | 2.38 µs | 226.7 ns | 0 |
+| `Instant::now` (Overhead) | Harness baseline (not on daemon hot path) | 10,000 | 0.0 ns | **231.0 ns** | 385.0 ns | 539.0 ns | 2.38 µs | 226.7 ns | 0 |
 
 * **Cold Multi-PID Pool Access:** Reading across a dynamic pool of external system/user PIDs incurs ~8.7 µs P50 latency (vs 3.3 µs for self), comfortably qualifying multi-PID candidate batches in microseconds.
-* **Tail Latency Preemption Diagnostics:** Multi-millisecond Max outliers were verified via `CLOCK_THREAD_CPUTIME_ID` and `ru_nivcsw` counters to be caused by OS CFS scheduler thread preemption (actual thread execution time remained < 50 µs), not kernel VFS latency.
-
+* **Tail Latency Preemption Diagnostics:** Outliers are flagged when wall time exceeds 500 µs **and** either `ru_nivcsw` incremented or on-CPU time stayed below 50 µs — a disjunction, so a flagged sample shows scheduler disturbance, low on-CPU time, or both. See `docs/ARCHITECTURE.md` §6.2 for the attribution and its limits.
 ### End-to-End Daemon Benchmarks: Idle vs Active App-Switching Pipeline
 
-Evaluated via `scripts/benchmark.sh` across both steady-state idle conditions ($N = 50$) and active live app-switching workloads ($N = 15$, cycling between Settings, Home, and Browser transitions):
+Evaluated via `scripts/benchmark.sh` across both steady-state idle conditions (`N = 50`) and active live app-switching workloads (`N = 15`, cycling between Settings, Home, and Browser transitions):
 
 | Metric | Workload Mode | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean |
 |---|---|---|---|---|---|---|---|---|
@@ -272,9 +275,9 @@ Evaluated via `scripts/benchmark.sh` across both steady-state idle conditions ($
 | **Active Pipeline Memory (PSS)**| Live App-Switch Traffic | 15 | 1,150 kB | **1,165 kB** | 1,183 kB | 1,183 kB | 1,183 kB | 1,165 kB |
 | **Resident Set Size (RSS)** | Idle Boot State | 50 | 3,744 kB | **3,848 kB** | 3,944 kB | 4,012 kB | 4,012 kB | 3,850 kB |
 | **Resident Set Size (RSS)** | Live App-Switch Traffic | 15 | 3,852 kB | **3,960 kB** | 4,044 kB | 4,044 kB | 4,044 kB | 3,965 kB |
-| **Inter-Event Idle CPU Wakeups** | Post-Traffic Idle Window | 65 | 0 | **0** | 0 | 0 | 0 | 0.0 |
+| **Inter-Event Idle CPU Wakeups** | Post-Traffic Idle Window | 50 + 15 | 0 | **0** | 0 | 0 | 0 | 0.0 |
 
-* **Live Workload Memory Cost:** Populating `alive_apps`, `fg_lru`, `pkg_to_pids`, and `recent_deaths` tables during active app-switching only increases steady-state PSS by **+56 kB** (to 1,165 kB), remaining well below the 2.5 MB budget.
+* **Live Workload Memory Cost:** Populating `alive_apps`, `fg_lru`, `pkg_to_pids`, and `recent_deaths` tables during active app-switching only increases steady-state PSS by **+56 kB** (to 1,165 kB); RSS grows from 3,848 kB to 3,960 kB, staying under the < 4 MB RSS target.
 * **Idle Wakeup Verification:** The single-threaded `epoll_wait` reactor produces strictly **0 CPU wakeups** during idle intervals between event bursts.
 
 ### Low-UID System Package Safety (Empirical AMS Verification)
@@ -286,17 +289,18 @@ Empirically verified on Android 14 that `cmd activity kill --user 0` terminates 
 The benchmark suite is completely automated and reproducible directly on Android hardware (API 24+, rootless `sh` compatible):
 
 ```bash
-# 1. Cross-compile release daemon and standalone microbenchmark harness
-cargo build --release
-cargo build --release --bench microbench
+# 1. Cross-compile the release daemon and the standalone microbenchmark harness for aarch64
+rustup target add aarch64-linux-android
+cargo build --release --target aarch64-linux-android
+cargo build --release --target aarch64-linux-android --bench microbench
 
 # 2. Push artifacts and runner script to Android device
 adb push target/aarch64-linux-android/release/mini-lmk /data/local/tmp/mini-lmk
 adb push $(ls -t target/aarch64-linux-android/release/deps/microbench-* | grep -v '\.d$' | head -n 1) /data/local/tmp/microbench
 adb push scripts/benchmark.sh /data/local/tmp/benchmark.sh
 
-# 3. Execute microbenchmark suite (multi-PID pool + dumpsys IPC comparison)
-adb shell "chmod 755 /data/local/tmp/mini-lmk /data/local/tmp/microbench /data/local/tmp/benchmark.sh && /data/local/tmp/microbench -n 10000 --dumpsys-iters 30"
+# 3. Execute microbenchmark suite (self + multi-PID pool procfs latency; flags: -n, -w, --json, --csv, --markdown)
+adb shell "chmod 755 /data/local/tmp/mini-lmk /data/local/tmp/microbench /data/local/tmp/benchmark.sh && /data/local/tmp/microbench -n 10000"
 
 # 4. Execute end-to-end active app-switching workload benchmark
 adb shell "/data/local/tmp/benchmark.sh -n 15 -a"

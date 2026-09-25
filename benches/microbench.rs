@@ -80,7 +80,6 @@ fn format_ns(ns: f64) -> String {
 
 const RUSAGE_THREAD: libc::c_int = 1;
 
-#[inline(always)]
 fn get_thread_nivcsw() -> i64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe {
@@ -89,7 +88,6 @@ fn get_thread_nivcsw() -> i64 {
     usage.ru_nivcsw
 }
 
-#[inline(always)]
 fn get_thread_cputime_ns() -> u64 {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     unsafe {
@@ -187,7 +185,7 @@ fn print_text_table(results: &[BenchmarkResult]) {
 
 fn print_markdown_table(results: &[BenchmarkResult]) {
     println!("\n### Microbenchmark Empirical Latency Distribution");
-    println!("| Target / Operation | Source / Mechanism | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean | CFS Preemptions |");
+    println!("| Target / Operation | Source / Mechanism | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean | Flagged Preemption Samples |");
     println!("|---|---|---|---|---|---|---|---|---|---|");
 
     for r in results {
