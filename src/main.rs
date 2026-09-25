@@ -27,6 +27,8 @@ use parser::{parse_logcat_line, LogcatEvent, ProcDiedEvent, ProcStartEvent, Resu
 use procfs::{check_mem_critical, read_oom_score_adj, read_statm_rss_kb, read_total_ram_mb};
 use telemetry::{escape_json, format_time_hms_ms, SessionStats, TelemetrySink};
 
+use std::io::Write;
+use std::io::{stderr, stdout};
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs;
@@ -208,13 +210,13 @@ impl DaemonState {
 
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epoll_fd < 0 {
-            eprintln!("[FATAL] epoll_create1 failed: {}", std::io::Error::last_os_error());
+            let _ = writeln!(stderr(), "[FATAL] epoll_create1 failed: {}", std::io::Error::last_os_error());
             std::process::exit(1);
         }
 
         let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if inotify_fd < 0 {
-            eprintln!("[FATAL] inotify_init1 failed: {}", std::io::Error::last_os_error());
+            let _ = writeln!(stderr(), "[FATAL] inotify_init1 failed: {}", std::io::Error::last_os_error());
             std::process::exit(1);
         }
 
@@ -223,7 +225,7 @@ impl DaemonState {
             u64: TOKEN_INOTIFY,
         };
         if unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, inotify_fd, &mut ev) } < 0 {
-            eprintln!("[FATAL] epoll_ctl inotify failed: {}", std::io::Error::last_os_error());
+            let _ = writeln!(stderr(), "[FATAL] epoll_ctl inotify failed: {}", std::io::Error::last_os_error());
             std::process::exit(1);
         }
 
@@ -237,7 +239,7 @@ impl DaemonState {
         let screen_on_start = if screen_on { Some(now) } else { None };
         let screen_off_start = if !screen_on { Some(now) } else { None };
         if !json_stdout {
-            println!("[DAEMON] Initial display state: screen_on={}", screen_on);
+            let _ = writeln!(stdout(), "[DAEMON] Initial display state: screen_on={}", screen_on);
         }
 
         let total_ram_mb = read_total_ram_mb();
@@ -249,7 +251,7 @@ impl DaemonState {
             1 // > 8.5GB RAM devices (12GB+ configurations)
         };
         if !json_stdout {
-            println!(
+            let _ = writeln!(stdout(),
                 "[DAEMON] Hardware profile: total_ram={}MB (default max_kills={})",
                 total_ram_mb, detected_default_kills
             );
@@ -307,10 +309,6 @@ impl DaemonState {
         if self.session_stats.bg_spawns == 0 && self.session_stats.bg_deaths == 0 {
             return;
         }
-        let json = format!(
-            r#"{{"ts":{},"event":"bg_summary","interval_sec":{},"spawns":{},"deaths":{},"spawn_rss_kb":{}}}"#,
-            now_epoch, interval_sec, self.session_stats.bg_spawns, self.session_stats.bg_deaths, self.session_stats.spawn_rss_kb
-        );
         self.telemetry.emit_with(
             || {
                 let time_str = format_time_hms_ms(now_epoch);
@@ -322,7 +320,10 @@ impl DaemonState {
                 );
                 format!("{:<12}   {:<12} {:<26} {}", time_str, "BG_SUMMARY", "--", detail)
             },
-            &json,
+            || format!(
+                r#"{{"ts":{},"event":"bg_summary","interval_sec":{},"spawns":{},"deaths":{},"spawn_rss_kb":{}}}"#,
+                now_epoch, interval_sec, self.session_stats.bg_spawns, self.session_stats.bg_deaths, self.session_stats.spawn_rss_kb
+            ),
         );
         self.session_stats = SessionStats::default();
         self.session_start = now_epoch;
@@ -330,7 +331,7 @@ impl DaemonState {
 
     fn seed_initial_state(&mut self) {
         if !self.json_stdout {
-            println!("[DAEMON] Performing cold-start discovery...");
+            let _ = writeln!(stdout(), "[DAEMON] Performing cold-start discovery...");
         }
         let entries = match fs::read_dir("/proc") {
             Ok(e) => e,
@@ -372,7 +373,7 @@ impl DaemonState {
             }
         }
         if !self.json_stdout {
-            println!(
+            let _ = writeln!(stdout(),
                 "[DAEMON] Indexed {} active PIDs across {} packages.",
                 self.pid_to_pkg.len(),
                 self.pkg_to_pids.len()
@@ -406,7 +407,7 @@ impl DaemonState {
                 }
             }
             if !json_stdout {
-                println!("[CONFIG] Loaded {} entries from {}", set.len(), path);
+                let _ = writeln!(stdout(), "[CONFIG] Loaded {} entries from {}", set.len(), path);
             }
         }
     }
@@ -420,11 +421,6 @@ impl DaemonState {
 
         if self.config != prev_cfg {
             let now_epoch = Self::get_epoch_ms();
-            let json = format!(
-                r#"{{"ts":{},"event":"config_reload","t_idle_sec":{},"lru_protect_depth":{},"mem_critical_percent":{},"fg_lru_max_depth":{},"screen_off_harvest":{},"max_kills_per_pass":{}}}"#,
-                now_epoch, self.config.t_idle_sec, self.config.lru_protect_depth, self.config.mem_critical_percent,
-                self.config.fg_lru_max_depth, self.config.screen_off_harvest, self.config.max_kills_per_pass
-            );
             self.telemetry.emit_with(
                 || {
                     let time_str = format_time_hms_ms(now_epoch);
@@ -435,7 +431,11 @@ impl DaemonState {
                     );
                     format!("{:<12}   {:<12} {:<26} {}", time_str, "CONFIG_RELOAD", "--", detail)
                 },
-                &json,
+                || format!(
+                    r#"{{"ts":{},"event":"config_reload","t_idle_sec":{},"lru_protect_depth":{},"mem_critical_percent":{},"fg_lru_max_depth":{},"screen_off_harvest":{},"max_kills_per_pass":{}}}"#,
+                    now_epoch, self.config.t_idle_sec, self.config.lru_protect_depth, self.config.mem_critical_percent,
+                    self.config.fg_lru_max_depth, self.config.screen_off_harvest, self.config.max_kills_per_pass
+                ),
             );
         }
     }
@@ -465,7 +465,7 @@ impl DaemonState {
                             && !pkg.starts_with('-')
                         {
                             if !self.json_stdout {
-                                println!("[SYSTEM] Detected {}: {}", label, pkg);
+                                let _ = writeln!(stdout(), "[SYSTEM] Detected {}: {}", label, pkg);
                             }
                             if role == "android.app.role.HOME" {
                                 home_detected = true;
@@ -486,10 +486,10 @@ impl DaemonState {
                 .ok()
                 .filter(|o| o.status.success());
             if let Some(out) = out {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                if let Some(pkg) = parse_resolve_activity_pkg(&stdout) {
+                let resolve_out = String::from_utf8_lossy(&out.stdout);
+                if let Some(pkg) = parse_resolve_activity_pkg(&resolve_out) {
                     if !self.json_stdout {
-                        println!("[SYSTEM] Detected HOME (fallback): {}", pkg);
+                        let _ = writeln!(stdout(), "[SYSTEM] Detected HOME (fallback): {}", pkg);
                     }
                     self.dynamic_exclusions.insert(pkg.to_string());
                 }
@@ -504,8 +504,8 @@ impl DaemonState {
         for (label, key) in settings {
             if let Ok(output) = Command::new("/system/bin/cmd").args(["settings", "get", "secure", key]).output() {
                 if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let s = stdout.trim();
+                    let settings_out = String::from_utf8_lossy(&output.stdout);
+                    let s = settings_out.trim();
                     if !s.is_empty() && s != "null" && !s.starts_with("null") {
                         // Unpeel optional user prefix (e.g. "0:com.pkg/svc" -> "com.pkg/svc")
                         let unpeeled = if let Some((prefix, rest)) = s.split_once(':') {
@@ -514,7 +514,7 @@ impl DaemonState {
                         let pkg = unpeeled.split('/').next().unwrap_or(unpeeled).trim();
                         if !pkg.is_empty() && pkg.contains('.') && !pkg.contains(' ') && !pkg.starts_with('-') {
                             if !self.json_stdout {
-                                println!("[SYSTEM] Detected {}: {}", label, pkg);
+                                let _ = writeln!(stdout(), "[SYSTEM] Detected {}: {}", label, pkg);
                             }
                             self.dynamic_exclusions.insert(pkg.to_string());
                         }
@@ -528,7 +528,7 @@ impl DaemonState {
 
     fn spawn_logcat_stream(&mut self) {
         if !self.json_stdout {
-            println!("[DAEMON] Spawning unified logcat stream...");
+            let _ = writeln!(stdout(), "[DAEMON] Spawning unified logcat stream...");
         }
         let mut child = match Command::new("/system/bin/logcat")
             .args([
@@ -548,16 +548,18 @@ impl DaemonState {
         {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[FATAL] Failed to spawn logcat: {}", e);
+                let _ = writeln!(stderr(), "[FATAL] Failed to spawn logcat: {}", e);
+                self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
                 std::process::exit(1);
             }
         };
 
-        let stdout = child.stdout.take().expect("logcat stdout");
-        let raw_fd = stdout.into_raw_fd();
+        let logcat_pipe = child.stdout.take().expect("logcat stdout");
+        let raw_fd = logcat_pipe.into_raw_fd();
 
         if let Err(err) = probe_logcat_stream(&mut child, raw_fd) {
-            eprintln!("[FATAL] Logcat pipeline startup probe failed: {}", err);
+            let _ = writeln!(stderr(), "[FATAL] Logcat pipeline startup probe failed: {}", err);
+            self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
             std::process::exit(1);
         }
 
@@ -571,14 +573,15 @@ impl DaemonState {
             u64: TOKEN_LOGCAT_PIPE,
         };
         if unsafe { libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_ADD, raw_fd, &mut ev) } < 0 {
-            eprintln!("[FATAL] epoll_ctl logcat pipe failed: {}", std::io::Error::last_os_error());
+            let _ = writeln!(stderr(), "[FATAL] epoll_ctl logcat pipe failed: {}", std::io::Error::last_os_error());
+            self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
             std::process::exit(1);
         }
 
         self.logcat_fd = raw_fd;
         self.logcat_child = Some(child);
         if !self.json_stdout {
-            println!("[DAEMON] Logcat stream active on fd={}", self.logcat_fd);
+            let _ = writeln!(stdout(), "[DAEMON] Logcat stream active on fd={}", self.logcat_fd);
         }
     }
 
@@ -649,29 +652,27 @@ impl DaemonState {
         if is_game && !was_gaming {
             self.game_session_start = Some(now_epoch);
             self.game_intrusion_count = 0;
-            let json = format!(r#"{{"ts":{},"event":"game_session_start","pkg":"{}"}}"#, now_epoch, escape_json(pkg));
             self.telemetry.emit_with(
                 || {
                     let time_str = format_time_hms_ms(now_epoch);
                     format!("{:<12}   {:<12} {:<26} game_mode=active", time_str, "GAME_START", pkg)
                 },
-                &json,
+                || format!(r#"{{"ts":{},"event":"game_session_start","pkg":"{}"}}"#, now_epoch, escape_json(pkg)),
             );
         } else if !is_game && was_gaming {
             let duration_sec = self.game_session_start
                 .map(|s| now_epoch.saturating_sub(s) / 1000)
                 .unwrap_or(0);
-            let json = format!(
-                r#"{{"ts":{},"event":"game_session_end","duration_sec":{},"intrusions":{}}}"#,
-                now_epoch, duration_sec, self.game_intrusion_count
-            );
             self.telemetry.emit_with(
                 || {
                     let time_str = format_time_hms_ms(now_epoch);
                     let detail = format!("duration={}s  intrusions={}", duration_sec, self.game_intrusion_count);
                     format!("{:<12}   {:<12} {:<26} {}", time_str, "GAME_END", "--", detail)
                 },
-                &json,
+                || format!(
+                    r#"{{"ts":{},"event":"game_session_end","duration_sec":{},"intrusions":{}}}"#,
+                    now_epoch, duration_sec, self.game_intrusion_count
+                ),
             );
             self.game_session_start = None;
         }
@@ -682,10 +683,6 @@ impl DaemonState {
             self.current_fg = Some(pkg.to_string());
         }
 
-        let json = format!(
-            r#"{{"ts":{},"event":"fg_switch","pkg":"{}","component":"{}","prev_dur_ms":{},"is_game":{}}}"#,
-            now_epoch, escape_json(pkg), escape_json(component), prev_dur_ms, is_game
-        );
         self.telemetry.emit_with(
             || {
                 let time_str = format_time_hms_ms(now_epoch);
@@ -697,7 +694,10 @@ impl DaemonState {
                 };
                 format!("{:<12}   {:<12} {:<26} {}", time_str, "FG_SWITCH", pkg, prev_detail)
             },
-            &json,
+            || format!(
+                r#"{{"ts":{},"event":"fg_switch","pkg":"{}","component":"{}","prev_dur_ms":{},"is_game":{}}}"#,
+                now_epoch, escape_json(pkg), escape_json(component), prev_dur_ms, is_game
+            ),
         );
 
         if prev_pkg_opt.as_deref() != Some(pkg) {
@@ -723,10 +723,6 @@ impl DaemonState {
         if self.is_gaming && spawn_type != "top-activity" && spawn_type != "next-top-activity" {
             self.game_intrusion_count += 1;
             let excluded = self.is_excluded(pkg);
-            let json = format!(
-                r#"{{"ts":{},"event":"game_intrusion","pid":{},"uid":{},"pkg":"{}","proc":"{}","type":"{}","rss_kb":{},"excluded":{}}}"#,
-                now_epoch, pid, uid, escape_json(pkg), escape_json(raw_proc_name), escape_json(spawn_type), initial_rss_kb, excluded
-            );
             self.telemetry.emit_with(
                 || {
                     let time_str = format_time_hms_ms(now_epoch);
@@ -734,7 +730,10 @@ impl DaemonState {
                     let detail = format!("type={}  rss={}MB  excluded={}", spawn_type, rss_mb, excluded);
                     format!("{:<12}   {:<12} {:<26} {}", time_str, "GAME_INTRUDE", pkg, detail)
                 },
-                &json,
+                || format!(
+                    r#"{{"ts":{},"event":"game_intrusion","pid":{},"uid":{},"pkg":"{}","proc":"{}","type":"{}","rss_kb":{},"excluded":{}}}"#,
+                    now_epoch, pid, uid, escape_json(pkg), escape_json(raw_proc_name), escape_json(spawn_type), initial_rss_kb, excluded
+                ),
             );
         }
 
@@ -749,17 +748,16 @@ impl DaemonState {
         if let Some(death_time) = self.recent_deaths.remove(pkg) {
             let gap_ms = now_epoch.saturating_sub(death_time);
             if gap_ms <= 120_000 {
-                let json = format!(
-                    r#"{{"ts":{},"event":"respawn","pkg":"{}","gap_ms":{},"pid":{},"uid":{},"type":"{}"}}"#,
-                    now_epoch, escape_json(pkg), gap_ms, pid, uid, escape_json(spawn_type)
-                );
                 self.telemetry.emit_with(
                     || {
                         let time_str = format_time_hms_ms(now_epoch);
                         let detail = format!("gap={}ms  pid={}  type={}", gap_ms, pid, spawn_type);
                         format!("{:<12}   {:<12} {:<26} {}", time_str, "RESPAWN", pkg, detail)
                     },
-                    &json,
+                    || format!(
+                        r#"{{"ts":{},"event":"respawn","pkg":"{}","gap_ms":{},"pid":{},"uid":{},"type":"{}"}}"#,
+                        now_epoch, escape_json(pkg), gap_ms, pid, uid, escape_json(spawn_type)
+                    ),
                 );
             }
         }
@@ -805,17 +803,16 @@ impl DaemonState {
             let active_sec = self.screen_on_start
                 .map(|s| now_epoch.saturating_sub(s) / 1000)
                 .unwrap_or(0);
-            let json = format!(
-                r#"{{"ts":{},"event":"screen_state","state":"OFF","active_duration_sec":{}}}"#,
-                now_epoch, active_sec
-            );
             self.telemetry.emit_with(
                 || {
                     let time_str = format_time_hms_ms(now_epoch);
                     let detail = format!("active_session={:.1}s", active_sec as f64);
                     format!("{:<12}   {:<12} {:<26} {}", time_str, "SCREEN_OFF", "--", detail)
                 },
-                &json,
+                || format!(
+                    r#"{{"ts":{},"event":"screen_state","state":"OFF","active_duration_sec":{}}}"#,
+                    now_epoch, active_sec
+                ),
             );
             self.emit_bg_summary(now_epoch, active_sec);
 
@@ -826,17 +823,16 @@ impl DaemonState {
             let duration_sec = self.screen_off_start
                 .map(|s| now_epoch.saturating_sub(s) / 1000)
                 .unwrap_or(0);
-            let json = format!(
-                r#"{{"ts":{},"event":"screen_state","state":"ON","off_duration_sec":{}}}"#,
-                now_epoch, duration_sec
-            );
             self.telemetry.emit_with(
                 || {
                     let time_str = format_time_hms_ms(now_epoch);
                     let detail = format!("sleep={}s", duration_sec);
                     format!("{:<12}   {:<12} {:<26} {}", time_str, "SCREEN_ON", "--", detail)
                 },
-                &json,
+                || format!(
+                    r#"{{"ts":{},"event":"screen_state","state":"ON","off_duration_sec":{}}}"#,
+                    now_epoch, duration_sec
+                ),
             );
             self.emit_bg_summary(now_epoch, duration_sec);
 
@@ -994,11 +990,6 @@ impl DaemonState {
                 Some(v) => if v { "true" } else { "false" },
                 None => "null",
             };
-            let json = format!(
-                r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
-                now_epoch, event_name, escape_json(&cand.pkg), cand.live_pids, cand.total_rss_kb, reason, cand.idle_sec, cand.lru_pos, spawned_val, oom_adj, ams_protected, spawn_skipped
-            );
-
             self.telemetry.emit_with(
                 || {
                     let time_str = format_time_hms_ms(now_epoch);
@@ -1008,7 +999,10 @@ impl DaemonState {
                     );
                     format!("{:<12}   {:<12} {:<26} {}", time_str, tag, cand.pkg, detail)
                 },
-                &json,
+                || format!(
+                    r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
+                    now_epoch, event_name, escape_json(&cand.pkg), cand.live_pids, cand.total_rss_kb, reason, cand.idle_sec, cand.lru_pos, spawned_val, oom_adj, ams_protected, spawn_skipped
+                ),
             );
             self.telemetry.flush();
 
@@ -1033,7 +1027,8 @@ impl DaemonState {
                 }
                 if reaped == logcat_pid {
                     if RUNNING.load(Ordering::Relaxed) {
-                        eprintln!("[FATAL] Persistent logcat stream died (reaped via WNOHANG). Exiting.");
+                        let _ = writeln!(stderr(), "[FATAL] Persistent logcat stream died (reaped via WNOHANG). Exiting.");
+                        self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
                         std::process::exit(1);
                     }
                     break;
@@ -1044,16 +1039,16 @@ impl DaemonState {
 
     fn run(&mut self) {
         if !self.json_stdout {
-            println!(
+            let _ = writeln!(stdout(),
                 "[DAEMON] mini-lmk active (mode: {}).",
                 if self.act_mode { "ACT" } else { "OBSERVE" }
             );
-            println!("[DAEMON] Monitoring FDs: [TOKEN_LOGCAT_PIPE, TOKEN_INOTIFY]");
+            let _ = writeln!(stdout(), "[DAEMON] Monitoring FDs: [TOKEN_LOGCAT_PIPE, TOKEN_INOTIFY]");
         }
 
-        if !self.telemetry.json_stdout {
-            println!("{:<12}   {:<12} {:<26} DETAIL / REASON", "# TIME", "EVENT", "TARGET");
-            println!("{}", "-".repeat(80));
+        if self.telemetry.tabular_stdout() {
+            let _ = writeln!(stdout(), "{:<12}   {:<12} {:<26} DETAIL / REASON", "# TIME", "EVENT", "TARGET");
+            let _ = writeln!(stdout(), "{}", "-".repeat(80));
         }
 
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
@@ -1074,7 +1069,8 @@ impl DaemonState {
                     }
                     continue;
                 }
-                eprintln!("[FATAL] epoll_wait error: {}", err);
+                let _ = writeln!(stderr(), "[FATAL] epoll_wait error: {}", err);
+                self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
                 std::process::exit(1);
             }
 
@@ -1088,7 +1084,8 @@ impl DaemonState {
                     TOKEN_LOGCAT_PIPE => {
                         if revents & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0 {
                             if RUNNING.load(Ordering::Relaxed) {
-                                eprintln!("[FATAL] Logcat pipe HUP/ERR (0x{:x}). Exiting.", revents);
+                                let _ = writeln!(stderr(), "[FATAL] Logcat pipe HUP/ERR (0x{:x}). Exiting.", revents);
+                                self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
                                 std::process::exit(1);
                             }
                             break;
@@ -1121,12 +1118,13 @@ impl DaemonState {
                                 if last_newline > 0 {
                                     logcat_buf.drain(..last_newline);
                                 } else if logcat_buf.len() > 8192 {
-                                    eprintln!("[WARN] Discarding oversized un-terminated logcat line (len={})", logcat_buf.len());
+                                    let _ = writeln!(stderr(), "[WARN] Discarding oversized un-terminated logcat line (len={})", logcat_buf.len());
                                     logcat_buf.clear();
                                 }
                             } else if n == 0 {
                                 if RUNNING.load(Ordering::Relaxed) {
-                                    eprintln!("[FATAL] Logcat pipe EOF. Exiting.");
+                                    let _ = writeln!(stderr(), "[FATAL] Logcat pipe EOF. Exiting.");
+                                    self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
                                     std::process::exit(1);
                                 }
                                 break;
@@ -1138,7 +1136,8 @@ impl DaemonState {
                                     if !RUNNING.load(Ordering::Relaxed) { break; }
                                     continue;
                                 } else {
-                                    eprintln!("[FATAL] Logcat pipe error: {}. Exiting.", err);
+                                    let _ = writeln!(stderr(), "[FATAL] Logcat pipe error: {}. Exiting.", err);
+                                    self.telemetry.flush(); // std::process::exit skips Drop; flush the buffered records
                                     std::process::exit(1);
                                 }
                             }
@@ -1161,7 +1160,7 @@ impl DaemonState {
                             }
                         }
                         if !self.json_stdout {
-                            println!("[CONFIG] Configuration directory updated. Reloading...");
+                            let _ = writeln!(stdout(), "[CONFIG] Configuration directory updated. Reloading...");
                         }
                         self.ensure_inotify_watch();
                         self.reload_configs();
@@ -1169,10 +1168,14 @@ impl DaemonState {
                     _ => {}
                 }
             }
+
+            // One `write(2)` per `epoll_wait` batch instead of one per record: a burst of
+            // lifecycle events lands in a single batch, and the batch is over in microseconds.
+            self.telemetry.flush();
         }
 
         if !self.json_stdout {
-            println!("[DAEMON] Shutdown signal received. Exiting.");
+            let _ = writeln!(stdout(), "[DAEMON] Shutdown signal received. Exiting.");
         }
         if let Some(mut child) = self.logcat_child.take() {
             let _ = child.kill();
@@ -1252,7 +1255,7 @@ impl DaemonState {
 }
 
 fn print_help() {
-    println!(
+    let _ = writeln!(stdout(),
         r#"mini-lmk - Rootless event-driven memory manager for Android 7.0+ (API 24+)
 Usage: mini-lmk <MODE> [OPTIONS]
 
@@ -1276,16 +1279,16 @@ fn main() {
             "--observe" => mode = Some(false),
             "--json" => json_stdout = true,
             "-h" | "--help" => return print_help(),
-            other => eprintln!("[WARN] Unknown argument: {}", other),
+            other => { let _ = writeln!(stderr(), "[WARN] Unknown argument: {}", other); }
         }
     }
 
     let Some(act_mode) = mode else {
-        eprintln!("[ERROR] Operating mode must be specified: use --observe or --act\n");
+        let _ = writeln!(stderr(), "[ERROR] Operating mode must be specified: use --observe or --act\n");
         return print_help();
     };
 
-    println!("=== mini-lmk daemon ===");
+    let _ = writeln!(stdout(), "=== mini-lmk daemon ===");
     DaemonState::new(act_mode, json_stdout).run();
 }
 

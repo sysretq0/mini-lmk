@@ -17,7 +17,7 @@
 
 use std::fs::{self, File, OpenOptions};
 
-use std::io::{BufWriter, Write};
+use std::io::{stdout, BufWriter, Write};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormattedTime([u8; 12]);
@@ -100,10 +100,18 @@ pub struct TelemetrySink {
     bytes_written: usize,
     log_path: String,
     pub json_stdout: bool,
+    stdout_tty: bool,
 }
 
 impl TelemetrySink {
     pub fn new(log_path: &str, json_stdout: bool) -> Self {
+        let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+        Self::with_stdout(log_path, json_stdout, tty)
+    }
+
+    /// `stdout_tty` is a parameter rather than an `isatty()` call inside [`Self::new`] so tests
+    /// stay deterministic: under `cargo test` fd 1 is a pipe, never a terminal.
+    pub fn with_stdout(log_path: &str, json_stdout: bool, stdout_tty: bool) -> Self {
         let mut current_bytes = 0;
         if let Ok(meta) = fs::metadata(log_path) {
             current_bytes = meta.len() as usize;
@@ -114,6 +122,7 @@ impl TelemetrySink {
             bytes_written: current_bytes,
             log_path: log_path.to_string(),
             json_stdout,
+            stdout_tty,
         };
 
         if sink.bytes_written >= ROTATION_THRESHOLD_BYTES {
@@ -123,6 +132,23 @@ impl TelemetrySink {
         }
 
         sink
+    }
+
+    /// Whether nothing at all will be rendered for this event: no log file, no `--json`
+    /// contract, and no terminal to read the tabular column. The log file is the deciding
+    /// factor for a background daemon — `service.sh` redirects stdout to `/dev/null`, so
+    /// `operations.log` must keep receiving records even though no closure output is printed.
+    #[inline]
+    pub fn silent(&self) -> bool {
+        self.writer.is_none() && !self.json_stdout && !self.stdout_tty
+    }
+
+    /// Whether the columnar table actually reaches stdout. The startup header is printed under
+    /// exactly this condition, so a daemon whose stdout is redirected prints neither header nor
+    /// rows; `operations.log` is the only per-event artifact in that mode.
+    #[inline]
+    pub fn tabular_stdout(&self) -> bool {
+        !self.json_stdout && self.stdout_tty
     }
 
     fn open_file(&mut self) {
@@ -153,6 +179,9 @@ impl TelemetrySink {
         self.bytes_written = 0;
     }
 
+    /// Buffer the record; do **not** flush. The reactor calls [`Self::flush`] once per
+    /// `epoll_wait` batch and before every `exit`, so a burst of events costs one `write(2)`
+    /// instead of one per line. Public so `benches/microbench.rs` can time the real write path.
     pub fn write_to_log(&mut self, line: &str) {
         let line_len = line.len() + 1;
         if self.bytes_written + line_len >= ROTATION_THRESHOLD_BYTES {
@@ -161,27 +190,36 @@ impl TelemetrySink {
         if let Some(ref mut w) = self.writer {
             if writeln!(w, "{}", line).is_ok() {
                 self.bytes_written += line_len;
-                let _ = w.flush();
             }
         }
     }
 
     #[inline]
-    pub fn emit_with<F>(&mut self, make_tabular: F, json_line: &str)
+    pub fn emit_with<FJ, FT>(&mut self, make_tabular: FT, make_json: FJ)
     where
-        F: FnOnce() -> String,
+        FJ: FnOnce() -> String,
+        FT: FnOnce() -> String,
     {
-        if self.json_stdout {
-            println!("{}", json_line);
-        } else {
-            let tabular = make_tabular();
-            println!("{}", tabular);
+        // Both halves are lazy: nothing is allocated or formatted for a sink that will not
+        // consume it.
+        if self.silent() {
+            return;
         }
-        self.write_to_log(json_line);
+        let json_line = make_json();
+        if self.json_stdout {
+            // `--json` stdout is a machine contract (axcore, a pipe), so it holds regardless
+            // of whether fd 1 is a terminal.
+            let _ = writeln!(stdout(), "{}", json_line);
+        } else if self.stdout_tty {
+            // Tabular rendering costs a `localtime_r` and a second String; it exists for a
+            // human reading a terminal, so that is the only place it runs.
+            let _ = writeln!(stdout(), "{}", make_tabular());
+        }
+        self.write_to_log(&json_line);
     }
 
     pub fn flush(&mut self) {
-        let _ = std::io::stdout().flush();
+        let _ = stdout().flush();
         if let Some(ref mut w) = self.writer {
             let _ = w.flush();
         }
@@ -223,9 +261,15 @@ mod tests {
         let _ = fs::remove_file(&old_path_str);
 
         {
-            let mut sink = TelemetrySink::new(path_str, false);
-            sink.emit_with(|| "12:00:00.000   FG_SWITCH    com.test                   prev=--".to_string(), r#"{"event":"fg_switch"}"#);
-            sink.emit_with(|| "12:00:01.000   KILL         com.test.bg                rss=100MB".to_string(), r#"{"event":"kill"}"#);
+            let mut sink = TelemetrySink::with_stdout(path_str, false, true);
+            sink.emit_with(
+                || "12:00:00.000   FG_SWITCH    com.test                   prev=--".to_string(),
+                || r#"{"event":"fg_switch"}"#.to_string(),
+            );
+            sink.emit_with(
+                || "12:00:01.000   KILL         com.test.bg                rss=100MB".to_string(),
+                || r#"{"event":"kill"}"#.to_string(),
+            );
             sink.flush();
             assert!(sink.bytes_written > 0);
 
@@ -233,7 +277,10 @@ mod tests {
             sink.rotate();
             assert_eq!(sink.bytes_written, 0);
 
-            sink.emit_with(|| "12:00:02.000   SCREEN_OFF   --                         active=10s".to_string(), r#"{"event":"screen_state"}"#);
+            sink.emit_with(
+                || "12:00:02.000   SCREEN_OFF   --                         active=10s".to_string(),
+                || r#"{"event":"screen_state"}"#.to_string(),
+            );
             sink.flush();
         }
 
@@ -262,39 +309,76 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_with_lazy_evaluation() {
+    fn test_emit_with_output_gates() {
         let mut tmp_path = std::env::temp_dir();
-        tmp_path.push("mini_lmk_lazy_test.log");
+        tmp_path.push("mini_lmk_gates_test.log");
+        let path_str = tmp_path.to_str().unwrap();
+        let _ = fs::remove_file(&tmp_path);
+        // Parent directory does not exist -> open_file() leaves `writer` as None.
+        let dead_path = "/no-such-dir-mlmk/operations.log";
+
+        // (json_stdout, stdout_tty, log_openable, columnar expected, json expected)
+        let cases = [
+            (true, true, true, false, true),     // --json on a terminal
+            (false, true, true, true, true),     // interactive: columnar row plus file record
+            (false, false, true, false, true),   // service.sh: the file record is all that runs
+            (false, false, false, false, false), // nowhere to write: both closures skipped
+        ];
+        for (json, tty, log_ok, want_tabular, want_json) in cases {
+            let path = if log_ok { path_str } else { dead_path };
+            let mut sink = TelemetrySink::with_stdout(path, json, tty);
+            let (mut tabular, mut made_json) = (false, false);
+            sink.emit_with(
+                || {
+                    tabular = true;
+                    "rendered-row".to_string()
+                },
+                || {
+                    made_json = true;
+                    r#"{"event":"test"}"#.to_string()
+                },
+            );
+            assert_eq!(tabular, want_tabular, "columnar closure (json={json}, tty={tty})");
+            assert_eq!(
+                made_json, want_json,
+                "json closure (json={json}, tty={tty}, log_openable={log_ok})"
+            );
+            sink.flush();
+        }
+
+        let content = fs::read_to_string(&tmp_path).unwrap();
+        assert_eq!(
+            content.matches(r#"{"event":"test"}"#).count(),
+            3,
+            "operations.log keeps receiving records in every mode that can open it"
+        );
+        assert!(!content.contains("rendered-row"), "the two formatters never mix outputs");
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn test_redirected_stdout_still_logs() {
+        let mut tmp_path = std::env::temp_dir();
+        tmp_path.push("mini_lmk_silent_test.log");
         let path_str = tmp_path.to_str().unwrap();
         let _ = fs::remove_file(&tmp_path);
 
-        // When json_stdout is true, tabular closure is NEVER evaluated (0 allocations)
-        {
-            let mut sink = TelemetrySink::new(path_str, true);
-            let mut called = false;
-            sink.emit_with(
-                || {
-                    called = true;
-                    "never_evaluated".to_string()
-                },
-                r#"{"event":"test"}"#,
-            );
-            assert!(!called, "Tabular closure should NOT be evaluated in JSON mode");
-        }
-
-        // When json_stdout is false, tabular closure IS evaluated
-        {
-            let mut sink = TelemetrySink::new(path_str, false);
-            let mut called = false;
-            sink.emit_with(
-                || {
-                    called = true;
-                    "evaluated".to_string()
-                },
-                r#"{"event":"test"}"#,
-            );
-            assert!(called, "Tabular closure should be evaluated in tabular mode");
-        }
+        // No --json, no terminal, but the log file IS openable: the record must still be logged.
+        let mut sink = TelemetrySink::with_stdout(path_str, false, false);
+        assert!(!sink.silent(), "an open log file is an output");
+        let mut tabular_called = false;
+        sink.emit_with(
+            || {
+                tabular_called = true;
+                "never".to_string()
+            },
+            || r#"{"event":"test"}"#.to_string(),
+        );
+        assert!(!tabular_called, "columnar rendering needs a terminal");
+        sink.flush();
+        assert!(fs::read_to_string(&tmp_path)
+            .unwrap()
+            .contains(r#"{"event":"test"}"#));
 
         let _ = fs::remove_file(&tmp_path);
     }

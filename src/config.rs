@@ -15,6 +15,8 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
+use std::io::Write;
+use std::io::stdout;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +148,7 @@ impl RuntimeConfig {
         if let Ok(text) = std::fs::read_to_string(path) {
             self.parse_str(&text);
             if !quiet {
-                println!(
+                let _ = writeln!(stdout(),
                     "[CONFIG] Active: t_idle={}s, lru_depth={}, mem_crit={}%, fg_lru_max={}, screen_off_harvest={}, max_kills_per_pass={}, min_oom_adj={}",
                     self.t_idle_sec, self.lru_protect_depth, self.mem_critical_percent, self.fg_lru_max_depth, self.screen_off_harvest, self.max_kills_per_pass, self.min_oom_score_adj
                 );

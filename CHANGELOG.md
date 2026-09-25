@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Terminal-Gated Table Output:** `TelemetrySink` resolves `isatty(1)` once at construction and renders the aligned human-readable table only when stdout is a terminal. `--json` is exempt: its NDJSON stream is a machine contract and is still written to a pipe or `/dev/null`. `scripts/benchmark.sh`, which waits for the `Indexed` and `Monitoring FDs` banners, is unaffected because the one-shot startup banners stay unconditional.
+- **Write-path microbenchmarks:** two `telemetry::write_to_log` rows in `benches/microbench.rs` time one 190-byte NDJSON record through the real sink on a temp file, comparing the previous flush-every-line policy with the current batched one (reference device, 10,000 iterations: P50 1.23 µs → 77 ns, mean 1.57 µs → 385.6 ns).
+
+### Changed
+- **Lazy Telemetry Formats:** `emit_with()` takes the JSON and terminal-table renderings as closures, so a format with no destination is never built. A headless daemon no longer allocates two `String`s per event and no longer calls `localtime_r` for a table sent to `/dev/null`; the one branch that builds neither format is a sink whose log failed to open and whose stdout is neither a terminal nor JSON mode.
+- **Batched Log Flushing:** `write_to_log` no longer flushes after every line. The reactor flushes once per `epoll_wait` batch, every `std::process::exit` path flushes before exiting (`exit` skips destructors), and a kill record is flushed immediately after it is emitted so the reap decision is on disk before the handler returns to the batch.
+- **Non-panicking writes:** every `println!`/`eprintln!` in the daemon and config loader became `let _ = writeln!(stdout(), ..)` / `writeln!(stderr(), ..)`.
+- **Benchmark tables refreshed** from a single run of the current build on the reference device (Android 14, API 34, kernel 5.10, aarch64): microbenchmark rows, cold-start discovery, PSS/RSS percentiles, and the end-to-end idle/active wakeup counts.
+
+### Fixed
+- **A dead shell can no longer kill the daemon.** With `SIGPIPE` ignored and `panic = "abort"` in `[profile.release]`, a `println!` failing with `EPIPE`/`EIO` — the normal outcome once the detached `adb shell` that launched the daemon goes away, and what `stdout.log` used to fill with table rows — escalated into `SIGABRT`. A lost log line now costs a lost log line.
+- **Records are not dropped on error exits.** The `exit(1)` paths in `spawn_logcat_stream()`, `reap_terminated_children()` and `run()` previously terminated without flushing `operations.log`.
+
+### Known Limitations
+- A `SIGABRT` landing between two flushes discards the records still in the 8 KB buffer — at most the events of one `epoll_wait` batch. No `fsync` is performed, so durability against power loss is unchanged from the previous per-line policy.
+
+### Tests
+- `test_emit_with_output_gates` walks all four (`json_stdout`, `isatty`, log-openable) combinations and asserts which closure runs, that `operations.log` still receives the record in every mode that can open it, and that the two formatters never mix outputs. `test_redirected_stdout_still_logs` covers the `service.sh` case specifically: no `--json`, no terminal, log openable — the columnar closure never runs, `silent()` stays false, and the NDJSON record reaches the file.
+
+---
+
 ## [1.3.0] - 2026-09-25
 
 ### Changed

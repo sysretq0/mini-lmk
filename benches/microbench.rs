@@ -346,6 +346,60 @@ fn main() {
         black_box(&*ft);
     }));
 
+    // 8/9. telemetry::write_to_log — the same fg_switch NDJSON record appended to a real
+    // file, once with the historical per-line flush and once with the per-batch flush the
+    // reactor now uses. The batched row concentrates 64 buffered appends into one write(2),
+    // so its median is the memcpy into the 8 KB buffer and its P99 is the flush spike.
+    let record = r#"{"ts":1790255284675,"event":"fg_switch","pkg":"com.example.app","component":"com.example.app/.MainActivity","prev_dur_ms":41233,"is_game":false}"#;
+    let tmp = std::env::temp_dir();
+    let per_line_path = tmp.join("mini_lmk_bench_perline.log");
+    let batch_path = tmp.join("mini_lmk_bench_batch.log");
+    // Rotation may have renamed each log to `<path>.old`; remove both names.
+    for path in [&per_line_path, &batch_path] {
+        let _ = std::fs::remove_file(path);
+        let mut old = path.as_os_str().to_os_string();
+        old.push(".old");
+        let _ = std::fs::remove_file(&old);
+    }
+
+    if let (Some(per_line_str), Some(batch_str)) = (per_line_path.to_str(), batch_path.to_str()) {
+        let mut per_line = telemetry::TelemetrySink::new(per_line_str, true);
+        results.push(run_bench(
+            "telemetry::write_to_log (flush every line)",
+            warmup,
+            iterations,
+            || {
+                per_line.write_to_log(record);
+                per_line.flush();
+            },
+        ));
+
+        let mut batched = telemetry::TelemetrySink::new(batch_str, true);
+        let mut pending = 0usize;
+        results.push(run_bench(
+            "telemetry::write_to_log (flush every 64 lines)",
+            warmup,
+            iterations,
+            || {
+                batched.write_to_log(record);
+                pending += 1;
+                if pending == 64 {
+                    pending = 0;
+                    batched.flush();
+                }
+            },
+        ));
+        batched.flush();
+        per_line.flush();
+    }
+    // Rotation may have renamed each log to `<path>.old`; remove both names.
+    for path in [&per_line_path, &batch_path] {
+        let _ = std::fs::remove_file(path);
+        let mut old = path.as_os_str().to_os_string();
+        old.push(".old");
+        let _ = std::fs::remove_file(&old);
+    }
+
     if json_out {
         print_json(&results);
     } else if csv_out {

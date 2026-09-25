@@ -42,7 +42,7 @@ Prior to entering `epoll_wait()`, the daemon executes an instantaneous sanity ch
 
 #### Signal Handling & Child Reaping
 * POSIX signals `SIGINT` and `SIGTERM` are registered with `sa_flags = 0` (strictly **no `SA_RESTART`**), ensuring `epoll_wait()` returns `EINTR` immediately upon signal delivery for clean shutdown.
-* Broken pipe (`SIGPIPE`) is explicitly ignored (`SIG_IGN`).
+* Broken pipe (`SIGPIPE`) is explicitly ignored (`SIG_IGN`). Because the binary is built with `panic = "abort"`, a `println!` whose `write(2)` fails on a detached terminal would escalate a lost log line into `SIGABRT`; all writes therefore go through `let _ = writeln!(stdout(), ..)` / `writeln!(stderr(), ..)`, so a disappearing consumer costs output, never the daemon. The terminal table and its column header are additionally gated on `isatty(1)` (§5.2), which keeps the supervisor's `stdout.log` free of event rows, while the one-shot startup banners are gated only on `--json` — that is what lets `scripts/benchmark.sh` keep grepping `Indexed` and `Monitoring FDs` from a redirected stdout.
 * Terminated child processes (`logcat` or asynchronous `cmd activity kill` invocations) are reaped non-blocking after `epoll_wait()` unblocks via `libc::waitpid(-1, &mut status, WNOHANG)`.
 
 ### 1.3 Unified Native Event Stream
@@ -378,7 +378,20 @@ Package names triggering Game Mode entry flushing (`T_idle -> 10s`). **Empty by 
 
 ### 5.2 Telemetry Logging Format (`logs/operations.log`)
 
-The daemon writes structured Newline-Delimited JSON (NDJSON) through a `BufWriter` that is flushed after every line (so the buffer mainly serves partial-write coalescing, not deferred I/O), with automatic 512 KB log rotation (`operations.log.old`, permissions `0666` on Unix). Individual process lifecycle spawns and exits are aggregated into `bg_summary` events to prevent log spam and disk thrashing: the record is suppressed entirely when both counters are zero, and its `interval_sec` is the window being summarized — time since the previous summary on a foreground switch, or the active/sleep duration of the screen session that just ended on a `screen_state` transition.
+The daemon writes structured Newline-Delimited JSON (NDJSON) through an 8 KB `BufWriter`, with automatic 512 KB log rotation (`operations.log.old`, permissions `0666` on Unix). Individual process lifecycle spawns and exits are aggregated into `bg_summary` events to prevent log spam and disk thrashing: the record is suppressed entirely when both counters are zero, and its `interval_sec` is the window being summarized — time since the previous summary on a foreground switch, or the active/sleep duration of the screen session that just ended on a `screen_state` transition.
+
+**Write discipline.** `write_to_log` appends into the buffer and does not flush per line; the reactor flushes once per `epoll_wait` batch, and every `std::process::exit` path flushes first because `exit` skips destructors. A kill record is flushed immediately after it is emitted, so the reap decision is on disk before the handler returns to the batch — `cmd activity kill` is spawned *before* the record is built (the `spawned` field reports the outcome of that spawn), so the flush is about visibility, not about the child inheriting buffered state, which neither `posix_spawn` nor the `O_CLOEXEC` descriptor Rust opens the log with would permit. The tradeoff: a `SIGABRT` landing between two flushes discards the records still in the buffer — at most the events of one batch. No `fsync` is performed, so durability against power loss is unchanged from the earlier per-line policy. Measured cost of one 190-byte `fg_switch` record (§6.2): P50 **1.23 µs → 77 ns**, mean 1.57 µs → 385.6 ns, P99 5.46 µs → 8.62 µs, because the cost now lands on the batch boundary.
+
+**Routing rules** (`TelemetrySink::emit_with`) — each call site passes the JSON and terminal-table renderings as closures, so a rendering with no destination is never built:
+
+| `json_stdout` | stdout destination | log destination | what is built | what is written |
+|---|---|---|---|---|
+| `false` (default) | terminal | open | tabular + JSON | terminal table, log |
+| `false` | `/dev/null` or closed | open | JSON only | log |
+| `false` | `/dev/null` | closed | nothing | nothing |
+| `true` (`--json`) | any | open | JSON once | same buffer to both |
+
+The `isatty(1)` gate is consulted once in `TelemetrySink::new()`, never on the hot path, and `--json` is treated as a machine contract: its NDJSON goes to stdout even when stdout is a pipe or `/dev/null`. `operations.log` is written in every mode — including the `service.sh` case, where stdout is discarded and only the log receives records — so the only branch where `emit_with` drops an event is a sink whose log failed to open and whose stdout is neither a terminal nor asked for JSON.
 
 The emitted event vocabulary is exactly `kill`, `kill_skipped`, `simulated_kill`, `fg_switch`, `screen_state`, `bg_summary`, `respawn`, `game_intrusion`, `game_session_start`, `game_session_end`, and `config_reload`. `am_proc_died` produces **no** record of its own: deaths only surface as the `deaths` counter inside the next `bg_summary`, or as a `respawn` record when the package returns within 120 s.
 
@@ -417,20 +430,22 @@ To verify the necessity of the `uid >= 10000` fail-closed candidate guard, `cmd 
 
 ### 6.2 Microbenchmark Suite: Kernel-Direct Procfs Latency Distribution
 
-Evaluated via `benches/microbench.rs` across 1,000 warm-up cycles and 10,000 timed iterations, comparing hot-cache self inspection against real-world cold multi-PID pool traversal:
+Evaluated via `benches/microbench.rs` across 1,000 warm-up cycles and 10,000 timed iterations per row, comparing hot-cache self inspection against real-world cold multi-PID pool traversal. All rows are one run on the reference device (Android 14, API 34, kernel 5.10, aarch64):
 
 | Target / Operation | Mechanism / Scope | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean | Flagged Preemption Samples |
 |---|---|---|---|---|---|---|---|---|---|
-| `procfs::read_oom_score_adj` | self, hot cache | 10,000 | 2.85 µs | **3.31 µs** | 10.69 µs | 14.15 µs | 531.69 µs | 4.32 µs | 1 |
-| `procfs::read_oom_score_adj` | multi-PID pool (cold) | 10,000 | 4.69 µs | **8.69 µs** | 23.38 µs | 38.15 µs | 999.08 µs | 11.72 µs | 3 |
-| `procfs::read_statm_rss_kb` | self, hot cache | 10,000 | 3.69 µs | **4.23 µs** | 20.31 µs | 40.08 µs | 5.71 ms | 8.86 µs | 4 |
-| `procfs::read_statm_rss_kb` | multi-PID pool (cold) | 10,000 | 5.00 µs | **6.23 µs** | 10.46 µs | 14.77 µs | 450.38 µs | 7.07 µs | 0 |
-| `procfs::read_meminfo_kb` | `/proc/meminfo` | 10,000 | 7.69 µs | **8.00 µs** | 9.46 µs | 12.62 µs | 377.54 µs | 8.50 µs | 0 |
-| `telemetry::FormattedTime` | Stack buffer format | 10,000 | 76.0 ns | **307.0 ns** | 308.0 ns | 308.0 ns | 2.54 µs | 261.3 ns | 0 |
-| `Instant::now` (Overhead) | Harness baseline (not on daemon hot path) | 10,000 | 0.0 ns | **231.0 ns** | 385.0 ns | 539.0 ns | 2.38 µs | 226.7 ns | 0 |
+| `procfs::read_oom_score_adj` | self, hot cache | 10,000 | 3.15 µs | **3.69 µs** | 5.23 µs | 8.00 µs | 1.05 ms | 4.29 µs | 2 |
+| `procfs::read_oom_score_adj` | multi-PID pool (cold) | 10,000 | 6.23 µs | **8.62 µs** | 22.85 µs | 30.15 µs | 3.75 ms | 11.67 µs | 4 |
+| `procfs::read_statm_rss_kb` | self, hot cache | 10,000 | 4.00 µs | **4.62 µs** | 5.46 µs | 7.38 µs | 712.31 µs | 5.05 µs | 4 |
+| `procfs::read_statm_rss_kb` | multi-PID pool (cold) | 10,000 | 6.46 µs | **8.31 µs** | 10.77 µs | 12.85 µs | 851.08 µs | 9.23 µs | 4 |
+| `procfs::read_meminfo_kb` | `/proc/meminfo` | 10,000 | 8.31 µs | **9.23 µs** | 10.54 µs | 23.31 µs | 610.23 µs | 9.90 µs | 2 |
+| `telemetry::FormattedTime` | Stack buffer timestamp | 10,000 | 76.0 ns | **308.0 ns** | 308.0 ns | 308.0 ns | 3.46 µs | 281.5 ns | 0 |
+| `telemetry::write_to_log` | NDJSON append, flushed every line (previous policy) | 10,000 | 1.00 µs | **1.23 µs** | 1.46 µs | 5.46 µs | 494.54 µs | 1.57 µs | 0 |
+| `telemetry::write_to_log` | NDJSON append, flushed every 64 lines (current policy) | 10,000 | 0.0 ns | **77.0 ns** | 231.0 ns | 8.62 µs | 346.23 µs | 385.6 ns | 0 |
+| `Instant::now` (Overhead) | Harness baseline (not on daemon hot path) | 10,000 | 0.0 ns | **231.0 ns** | 308.0 ns | 308.0 ns | 1.00 µs | 214.9 ns | 0 |
 
 #### Architectural Key Takeaways:
-1. **Cold Multi-PID VFS Access:** Cycling through a pool of external PIDs across the system shifts P50 latency from 3.31 µs (self, pinned dcache) to 8.69 µs (external PID, VFS dentry traversal). Even under cold multi-PID access, candidate qualification completes in under **9 microseconds per PID**.
+1. **Cold Multi-PID VFS Access:** Cycling through a pool of external PIDs across the system shifts P50 latency from 3.69 µs (self, pinned dcache) to 8.62 µs (external PID, VFS dentry traversal). Even under cold multi-PID access, candidate qualification completes in under **9 microseconds per PID**.
 2. **Tail Latency Root Cause:** `microbench.rs` flags a sample when its wall time exceeds 500 µs **and** either `ru_nivcsw` incremented or `CLOCK_THREAD_CPUTIME_ID` stayed below 50 µs; the per-row counts are in the last column. Because the predicate is a disjunction, a flagged sample proves scheduler disturbance, sub-50 µs on-CPU time, or both — enough to rule out a kernel VFS stall (every mean stays between 4.3 µs and 11.7 µs) and consistent with **Linux CFS scheduler preemption**, but not proof that a context switch occurred in each individual flagged sample.
 
 ### 6.3 End-to-End Daemon Benchmarks: Idle vs Active App-Switching Pipeline
@@ -439,14 +454,14 @@ Evaluated via `scripts/benchmark.sh` across both steady-state idle conditions (`
 
 | Metric | Workload Mode | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean |
 |---|---|---|---|---|---|---|---|---|
-| **Cold-start Discovery** | Initial Boot Indexing | 50 | 181.1 ms | **251.6 ms** | 289.6 ms | 343.5 ms | 343.5 ms | 251.6 ms |
-| **Steady-State Memory (PSS)** | Idle Boot State | 50 | 1,081 kB | **1,109 kB** | 1,133 kB | 1,139 kB | 1,139 kB | 1,109 kB |
-| **Active Pipeline Memory (PSS)**| Live App-Switch Traffic | 15 | 1,150 kB | **1,165 kB** | 1,183 kB | 1,183 kB | 1,183 kB | 1,165 kB |
-| **Resident Set Size (RSS)** | Idle Boot State | 50 | 3,744 kB | **3,848 kB** | 3,944 kB | 4,012 kB | 4,012 kB | 3,850 kB |
-| **Resident Set Size (RSS)** | Live App-Switch Traffic | 15 | 3,852 kB | **3,960 kB** | 4,044 kB | 4,044 kB | 4,044 kB | 3,965 kB |
+| **Cold-start Discovery** | Initial Boot Indexing | 50 | 246.6 ms | **293.8 ms** | 315.1 ms | 316.1 ms | 316.1 ms | 283.7 ms |
+| **Steady-State Memory (PSS)** | Idle Boot State | 50 | 1,064 kB | **1,099 kB** | 1,117 kB | 1,120 kB | 1,120 kB | 1,097 kB |
+| **Active Pipeline Memory (PSS)**| Live App-Switch Traffic | 15 | 1,069 kB | **1,093 kB** | 1,117 kB | 1,117 kB | 1,117 kB | 1,093 kB |
+| **Resident Set Size (RSS)** | Idle Boot State | 50 | 3,764 kB | **3,876 kB** | 4,004 kB | 4,020 kB | 4,020 kB | 3,882 kB |
+| **Resident Set Size (RSS)** | Live App-Switch Traffic | 15 | 3,816 kB | **3,884 kB** | 3,948 kB | 3,948 kB | 3,948 kB | 3,887 kB |
 | **Inter-Event Idle CPU Wakeups** | Post-Traffic Idle Window | 50 + 15 | 0 | **0** | 0 | 0 | 0 | 0.0 |
 
-**Pipeline Memory Growth:** Active app-switching with populated `alive_apps`, `fg_lru`, `pkg_to_pids`, and `recent_deaths` tables increases steady-state PSS by only **+56 kB** (from 1,109 kB to 1,165 kB). The wakeup row pools the `N = 50` idle and `N = 15` active runs, which is why each sample is 0 and the mean is 0.0. Inter-event wakeups remain strictly **0** once traffic pauses.
+**Pipeline Memory Growth:** Populating `alive_apps`, `fg_lru`, `pkg_to_pids`, and `recent_deaths` during active app-switching is not resolvable at this sampling resolution — PSS P50 reads 1,093 kB under traffic versus 1,099 kB idle, and RSS moves 3,876 kB → 3,884 kB, inside the < 4 MB envelope. The wakeup row pools the `N = 50` idle and `N = 15` active runs, which is why each sample is 0 and the mean is 0.0. Inter-event wakeups remain strictly **0** once traffic pauses, and batched flushing does not change that: with no records in the buffer there is nothing to write.
 
 ---
 
