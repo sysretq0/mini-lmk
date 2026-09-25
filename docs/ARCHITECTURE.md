@@ -33,7 +33,7 @@ The daemon runs a pure push-based event loop with zero polling wakeups. The exec
 | Token | Descriptor Type | Source / Path | Trigger Condition | Reactor Action |
 |---|---|---|---|---|
 | `TOKEN_LOGCAT_PIPE` | Non-blocking Pipe (`O_NONBLOCK`) | Output of child `logcat` | Log buffer write | Parse event tag; update in-memory lifecycle state; evaluate reaping gates. Exits process on EOF/HUP. |
-| `TOKEN_INOTIFY` | Linux inotify | Watch on `<base>/config/` (`CLOSE_WRITE` \| `MOVED_TO`) | Config modified | Instantly reloads `exclude.list` and `games.list` in memory without dropping state. |
+| `TOKEN_INOTIFY` | Linux inotify | Watch on `<base>/config/` (`CLOSE_WRITE` \| `MOVED_TO` \| `CREATE` \| `DELETE`) | Config modified | Instantly reloads `daemon.conf`, `exclude.list`, and `games.list` in memory without dropping state. |
 
 ### 1.3 Unified Native Event Stream
 
@@ -66,7 +66,7 @@ logcat -b events -v tag -s wm_resume_activity am_resume_activity am_proc_start a
 
 * **`screen_toggled` (Display State Transitions):**
   * *Payload:* `0` (OFF) or `1` (ON).
-  * *Action:* Updates internal power state metrics and timers. On screen power-off (`0`), immediately triggers a reaping pass with `lru_protect_depth = 1` to harvest stale background memory while the display is unpowered.
+  * *Action:* Updates internal power state metrics and timers, tracking active session vs. sleep duration and emitting `SCREEN_OFF`/`SCREEN_ON` telemetry alongside background summaries. Intentionally avoids an immediate reaping pass on display lock to preserve multitasking across brief screen lock/unlock cycles; deep background harvesting is deferred to native Doze pulses (`device_idle_light_step`).
 
 * **`device_idle_light_step` (Native Doze Heartbeat):**
   * *Payload:* Empty.
@@ -197,7 +197,7 @@ Reap Evaluation Triggers:
 
 * **Game Focus Entry:** If the incoming package matches `games.list`, `T_idle` drops to `0`. All non-excluded background apps beyond `effective_lru_depth` are evicted immediately to maximize physical RAM before the game engine allocates its heap.
 * **Critical Memory Starvation:** If `/proc/meminfo` reports `MemAvailable < MEM_CRITICAL_PERCENT`, `T_idle` drops to `0` across standard application switches to prevent kernel direct-reclaim page stalls.
-* **Screen-Off Deep Harvest:** When the display powers down, `lru_protect_depth` drops to 1, and `T_idle` decays from 60s to 30s, purging accumulated background memory while the display panel is off.
+* **Screen-Off Deep Harvest:** During opportunistic screen-off maintenance on native Doze heartbeats (`device_idle_light_step`), `effective_lru_depth` drops to 1, and `T_idle` decays from 60s to 30s (once the screen has been off for > 60s), purging accumulated background memory while the display panel is unpowered.
 
 ### 3.3 Targeted RSS Density Sorting & Burst Capping
 
@@ -215,13 +215,16 @@ When multiple candidate packages qualify for eviction simultaneously:
 
 ## 4. Provisional Tuning Constants (Telemetry Calibration)
 
-The following parameters are provisional configuration variables. Their default values serve as baseline estimates and are subject to calibration based on empirical traces recorded in `<base>/logs/operations.log`:
+The following parameters in `daemon.conf` are live-calibrated via inotify. Their default values serve as baseline estimates and are subject to calibration based on empirical traces recorded in `<base>/logs/operations.log`:
 
 | Parameter | Provisional Default | Description & Calibration Target |
 |---|---|---|
-| `T_IDLE_DEFAULT_SEC` | `180` (3 minutes) | Base background idle threshold. Tuned against user app resume latency to avoid evicting apps returned to frequently. |
-| `LRU_PROTECT_DEPTH` | `3` packages | Depth of protected foreground history window. Protects active multitasking workflows. |
-| `MEM_CRITICAL_PERCENT` | `10%` of `MemTotal` | RAM watermark triggering emergency idle bypass. Correlated against `/proc/vmstat` `allocstall_normal` and `pgscan_direct`. |
+| `t_idle_sec` | `180` (3 minutes) | Base background idle threshold. Tuned against user app resume latency to avoid evicting apps returned to frequently. |
+| `lru_protect_depth` | `3` packages | Depth of protected foreground history window. Protects active multitasking workflows. |
+| `mem_critical_percent` | `10` (% of `MemTotal`) | RAM watermark triggering emergency idle bypass (`T_idle = 0s`). Correlated against `/proc/vmstat` `allocstall_normal` and `pgscan_direct`. |
+| `fg_lru_max_depth` | `10` packages | Maximum depth of the foreground history ring buffer. |
+| `screen_off_harvest` | `true` | Enables opportunistic screen-off maintenance during Doze heartbeats (`device_idle_light_step`). |
+| `max_kills_per_pass` | Auto-scaled (`1`–`4`) | Maximum candidate packages evicted per pass (burst cap). Auto-scales by physical RAM: `<=4.5 GB` -> 4, `4.5–8.5 GB` -> 2, `>8.5 GB` -> 1. |
 
 ---
 
@@ -252,6 +255,10 @@ lru_protect_depth=3
 mem_critical_percent=10
 fg_lru_max_depth=10
 screen_off_harvest=true
+
+# Maximum background apps evicted per reap pass (burst cap)
+# Defaults auto-scale by physical RAM: <=4.5GB -> 4, 4.5GB-8.5GB -> 2, >8.5GB -> 1
+# max_kills_per_pass=2
 ```
 
 #### Exclusions (`config/exclude.list`)

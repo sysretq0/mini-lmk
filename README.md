@@ -68,9 +68,12 @@ mini-lmk/
 ├── Cargo.toml               # Package manifest and release profile optimizations
 ├── LICENSE                  # GNU General Public License v3.0
 ├── README.md                # Project documentation and quickstart
+├── package.sh               # Multi-ABI AxManager plugin packaging script
 ├── run-daemon.sh            # Target hardware supervisor loop
 ├── docs/
 │   └── ARCHITECTURE.md      # Complete architectural specification & reference
+├── package/
+│   └── axmanager/           # AxManager / Axeron module configuration and scripts
 └── src/
     ├── config.rs            # Runtime configuration parsing (daemon.conf)
     ├── hasher.rs            # In-tree 64-bit FNV-1a hasher (zero-dependency)
@@ -144,8 +147,8 @@ rustup target add aarch64-linux-android
 # Build optimized release binary
 cargo build --release --target aarch64-linux-android
 
-# Run unit test suite
-cargo test --target aarch64-unknown-linux-gnu
+# Run unit test suite on host (e.g. aarch64-unknown-linux-gnu or x86_64-unknown-linux-gnu)
+cargo test --target $(rustc -vV | sed -n 's/host: //p')
 ```
 
 The release profile compiles with `opt-level = "z"`, fat LTO, symbol stripping, and single codegen units, generating a stripped native ELF under 400 KB.
@@ -195,7 +198,7 @@ Live operations are formatted into aligned columns on standard output:
 14:22:01.120   FG_SWITCH    com.shopee.id              prev=com.android.settings (14.2s)
 14:22:01.126   KILL         com.google.android.youtube rss=184MB  idle=410s  lru=4 [idle_expired]
 14:23:15.800   SCREEN_OFF   --                         active_session=74.6s
-14:25:40.200   SCREEN_ON    --                         sleep=144s  bg_spawns=5  rss_added=+64MB
+14:25:40.200   SCREEN_ON    --                         sleep=144s
 14:25:40.201   BG_SUMMARY   --                         interval=144s  spawns=5  deaths=4  rss_delta=+12MB
 ```
 
