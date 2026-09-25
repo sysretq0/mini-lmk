@@ -135,12 +135,8 @@ pub fn parse_resume_activity(payload: &str) -> Option<ResumeActivityEvent<'_>> {
             clean_comp = &clean_comp[..end_idx];
         }
     } else if clean_comp.contains(' ') {
-        // If not explicit cmp=, but contains whitespace, select the word containing '/'
-        for word in clean_comp.split_whitespace() {
-            if word.contains('/') {
-                clean_comp = word.trim_matches(['{', '}', '"', '\'']);
-                break;
-            }
+        if let Some(word) = clean_comp.split_whitespace().find(|w| w.contains('/')) {
+            clean_comp = word.trim_matches(['{', '}', '"', '\'']);
         }
     }
 
@@ -292,21 +288,7 @@ pub fn parse_proc_died(payload: &str) -> Option<ProcDiedEvent> {
         return None;
     }
 
-    // 1. Fast-path: Standard AOSP index 1 ([user, pid, proc_name, ...])
-    if let Ok(pid) = tokens[1].parse::<u32>() {
-        if pid > 0 && count > 2 && is_proc_name(tokens[2]) {
-            return Some(ProcDiedEvent { pid });
-        }
-    }
-
-    // 2. Legacy / 2-token format: [pid, proc_name]
-    if let Ok(pid) = tokens[0].parse::<u32>() {
-        if pid > 0 && is_proc_name(tokens[1]) {
-            return Some(ProcDiedEvent { pid });
-        }
-    }
-
-    // 3. Resilient scan: Candidate PID strictly followed by verified process identifier
+    // Scan for candidate PID strictly followed by verified process identifier
     for i in 0..count.saturating_sub(1) {
         if let Ok(pid) = tokens[i].parse::<u32>() {
             if pid > 0 && is_proc_name(tokens[i + 1]) {

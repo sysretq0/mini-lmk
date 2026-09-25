@@ -105,36 +105,33 @@ fn detect_initial_screen_on() -> bool {
 /// Non-allocating, sub-millisecond health probe for the spawned logcat stream.
 /// Validates child process survival and pipe integrity using non-blocking syscalls.
 pub fn probe_logcat_stream(child: &mut Child, pipe_fd: i32) -> Result<(), &'static str> {
-    let mut status: libc::c_int = 0;
-    let pid = child.id() as libc::pid_t;
-
     // 1. Instant check: Has the child already exited (e.g. exec failure, missing binary, or SELinux denial)?
-    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    if reaped == pid {
-        return Err("Child logcat process died immediately after spawn (SELinux denial, missing binary, or invalid arguments)");
-    } else if reaped < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ECHILD) {
-            return Err("Child logcat process died immediately after spawn (reaped/ECHILD)");
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            return Err("Child logcat process died immediately after spawn (SELinux denial, missing binary, or invalid arguments)");
         }
-        return Err("waitpid error checking logcat child status");
+        Err(_) => return Err("error checking logcat child status"),
+        Ok(None) => {}
     }
 
-    // 2. Check if the pipe file descriptor is valid
-    let flags = unsafe { libc::fcntl(pipe_fd, libc::F_GETFD) };
-    if flags < 0 {
+    if pipe_fd < 0 {
         return Err("Invalid logcat stdout pipe file descriptor");
     }
 
-    // 3. Zero-timeout poll on pipe_fd to detect immediate POLLHUP or POLLERR
+    // 2. Zero-timeout poll on pipe_fd to detect immediate POLLHUP, POLLERR, or POLLNVAL
     let mut pfd = libc::pollfd {
         fd: pipe_fd,
         events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
         revents: 0,
     };
     let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-    if ret > 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0) {
-        return Err("Immediate POLLHUP/POLLERR detected on logcat stdout pipe");
+    if ret > 0 {
+        if pfd.revents & libc::POLLNVAL != 0 {
+            return Err("Invalid logcat stdout pipe file descriptor (POLLNVAL)");
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            return Err("Immediate POLLHUP/POLLERR detected on logcat stdout pipe");
+        }
     }
 
     Ok(())
@@ -901,23 +898,16 @@ impl DaemonState {
 
             let rss_mb = cand.total_rss_kb / 1024;
 
-            let is_spawned = if self.act_mode {
-                if ams_protected {
-                    Some(false)
-                } else {
-                    Some(
-                        Command::new("/system/bin/cmd")
-                            .args(["activity", "kill", "--user", "all", &cand.pkg])
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn()
-                            .is_ok(),
-                    )
-                }
-            } else {
-                None
-            };
+            let is_spawned = self.act_mode.then(|| {
+                !ams_protected
+                    && Command::new("/system/bin/cmd")
+                        .args(["activity", "kill", "--user", "all", &cand.pkg])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .is_ok()
+            });
 
             let (event_name, tag, sim_suffix) = match (self.act_mode, ams_protected) {
                 (true, false) => ("kill", "KILL", ""),

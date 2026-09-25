@@ -73,30 +73,18 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         id: release-notes
         run: |
-          python3 -c "
-          import os, re
-          tag = os.environ.get('GITHUB_REF_NAME', '')
-          ver = tag.lstrip('v')
-          repo = os.environ.get('GITHUB_REPOSITORY', '')
-
-          notes = ''
-          if os.path.exists('CHANGELOG.md'):
-              with open('CHANGELOG.md', 'r', encoding='utf-8') as f:
-                  content = f.read()
-              pattern = rf'## \[{re.escape(ver)}\][^\n]*\n(.*?)(?=\n## \[|\Z)'
-              m = re.search(pattern, content, re.DOTALL)
-              if m:
-                  notes = m.group(1).strip()
-
-          changelog_link = f'https://github.com/{repo}/blob/{tag}/CHANGELOG.md'
-          if notes:
-              body = f'{notes}\n\n---\n**Full Changelog**: [{tag} Release Notes]({changelog_link})'
-          else:
-              body = f'See [CHANGELOG.md]({changelog_link}) for details and change history.'
-
-          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
-              out.write('body<<EOF\n' + body + '\nEOF\n')
-          "
+          TAG="${GITHUB_REF_NAME}"
+          REPO="${GITHUB_REPOSITORY}"
+          CHANGELOG_LINK="https://github.com/${REPO}/blob/${TAG}/CHANGELOG.md"
+          NOTES=$(awk -v ver="## [${TAG#v}]" 'index($0, ver) == 1 {f=1; next} /^## / {f=0} f' CHANGELOG.md | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
+          if [ -n "$NOTES" ]; then
+            BODY="${NOTES}"$'\n\n---\n'"**Full Changelog**: [${TAG} Release Notes](${CHANGELOG_LINK})"
+          else
+            BODY="See [CHANGELOG.md](${CHANGELOG_LINK}) for details and change history."
+          fi
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
