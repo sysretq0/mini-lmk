@@ -34,7 +34,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::IntoRawFd;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -45,10 +45,8 @@ extern "C" fn sig_handler(_: libc::c_int) {
 const TOKEN_LOGCAT_PIPE: u64 = 1;
 const TOKEN_INOTIFY: u64 = 2;
 
-#[derive(Debug)]
-struct AppRecord {
-    last_active: Instant,
-}
+/// Lower bound (2020-09-13) separating an unsynchronized boot RTC from NTP-synced wall clock.
+const RTC_SYNC_FLOOR_MS: u64 = 1_600_000_000_000;
 
 struct Candidate {
     pkg: String,
@@ -62,11 +60,12 @@ struct DaemonState {
     config: RuntimeConfig,
     json_stdout: bool,
 
-    alive_apps: FastMap<String, AppRecord>,
+    // Canonical base package -> last foreground/activity epoch-ms anchor (UID >= 10000 only).
+    alive_apps: FastMap<String, u64>,
     pid_to_pkg: FastMap<u32, String>,
     pkg_to_pids: FastMap<String, FastSet<u32>>,
     pkg_to_uid: FastMap<String, u32>,
-    recent_deaths: FastMap<String, Instant>,
+    recent_deaths: FastMap<String, u64>,
     user_exclusions: FastSet<String>,
     games: FastSet<String>,
     dynamic_exclusions: FastSet<String>,
@@ -75,10 +74,11 @@ struct DaemonState {
     telemetry: TelemetrySink,
     logcat_child: Option<Child>,
     current_fg: Option<String>,
-    screen_on_start: Option<Instant>,
-    screen_off_start: Option<Instant>,
-    game_session_start: Option<Instant>,
-    session_start: Instant,
+    screen_on_start: Option<u64>,
+    screen_off_start: Option<u64>,
+    game_session_start: Option<u64>,
+    session_start: u64,
+    last_event_epoch: u64,
 
     session_stats: SessionStats,
     page_size_kb: u64,
@@ -232,7 +232,7 @@ impl DaemonState {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page_size_kb = if page_size > 0 { (page_size as u64) / 1024 } else { 4 };
 
-        let now = Instant::now();
+        let now = Self::get_epoch_ms();
         let screen_on = detect_initial_screen_on();
         let screen_on_start = if screen_on { Some(now) } else { None };
         let screen_off_start = if !screen_on { Some(now) } else { None };
@@ -284,6 +284,10 @@ impl DaemonState {
             telemetry,
             json_stdout,
             session_start: now,
+            // Seed the classifier with the bootstrap read instead of a sentinel, so the
+            // unsynchronized-RTC -> NTP step is detected on the *first* event. The only
+            // value that legitimately suppresses detection is 0 (clock unavailable).
+            last_event_epoch: now,
             session_stats: SessionStats::default(),
             page_size_kb,
         };
@@ -319,7 +323,7 @@ impl DaemonState {
             &json,
         );
         self.session_stats = SessionStats::default();
-        self.session_start = Instant::now();
+        self.session_start = now_epoch;
     }
 
     fn seed_initial_state(&mut self) {
@@ -527,7 +531,7 @@ impl DaemonState {
         let mut child = match Command::new("/system/bin/logcat")
             .args([
                 "-b", "events",
-                "-v", "tag",
+                "-v", "epoch",
                 "-T", "1",
                 "-s",
                 "wm_resume_activity:V",
@@ -591,12 +595,10 @@ impl DaemonState {
             || self.current_fg.as_deref() == Some(pkg)
     }
 
-    fn on_resume_activity(&mut self, ev: &ResumeActivityEvent) {
+    fn on_resume_activity(&mut self, ev: &ResumeActivityEvent, now_epoch: u64) {
         let pkg = ev.pkg;
         let component = ev.component;
 
-        let now = Instant::now();
-        let now_epoch = Self::get_epoch_ms();
         let mut prev_dur_ms = 0u64;
 
         let prev_pkg_opt = self.current_fg.take();
@@ -605,19 +607,17 @@ impl DaemonState {
                 // Guard: Only user/app packages with verified UID >= 10000 may enter alive_apps.
                 // Fail-closed: If UID cannot be resolved, assume protected/system and DO NOT insert.
                 if self.pkg_to_uid.get(prev_pkg).map_or(false, |&uid| uid >= 10000) {
-                    if let Some(rec) = self.alive_apps.get_mut(prev_pkg) {
-                        prev_dur_ms = now.duration_since(rec.last_active).as_millis() as u64;
-                        rec.last_active = now;
+                    if let Some(anchor) = self.alive_apps.get_mut(prev_pkg) {
+                        prev_dur_ms = now_epoch.saturating_sub(*anchor);
+                        *anchor = now_epoch;
                     } else {
-                        self.alive_apps.insert(prev_pkg.clone(), AppRecord {
-                            last_active: now,
-                        });
+                        self.alive_apps.insert(prev_pkg.clone(), now_epoch);
                     }
                 }
             }
         }
 
-        let interval_sec = now.duration_since(self.session_start).as_secs();
+        let interval_sec = now_epoch.saturating_sub(self.session_start) / 1000;
         self.emit_bg_summary(now_epoch, interval_sec);
 
         // If the departed package was only in foreground for < 500ms (e.g. trampoline, chooser, auth pulse),
@@ -645,7 +645,7 @@ impl DaemonState {
         self.is_gaming = is_game;
 
         if is_game && !was_gaming {
-            self.game_session_start = Some(now);
+            self.game_session_start = Some(now_epoch);
             self.game_intrusion_count = 0;
             let json = format!(r#"{{"ts":{},"event":"game_session_start","pkg":"{}"}}"#, now_epoch, escape_json(pkg));
             self.telemetry.emit_with(
@@ -657,7 +657,7 @@ impl DaemonState {
             );
         } else if !is_game && was_gaming {
             let duration_sec = self.game_session_start
-                .map(|s| now.duration_since(s).as_secs())
+                .map(|s| now_epoch.saturating_sub(s) / 1000)
                 .unwrap_or(0);
             let json = format!(
                 r#"{{"ts":{},"event":"game_session_end","duration_sec":{},"intrusions":{}}}"#,
@@ -699,19 +699,17 @@ impl DaemonState {
         );
 
         if prev_pkg_opt.as_deref() != Some(pkg) {
-            self.evaluate_reaping_pipeline();
+            self.evaluate_reaping_pipeline(now_epoch);
         }
     }
 
-    fn on_proc_start(&mut self, ev: &ProcStartEvent) {
+    fn on_proc_start(&mut self, ev: &ProcStartEvent, now_epoch: u64) {
         let pid = ev.pid;
         let uid = ev.uid;
         let raw_proc_name = ev.proc_name;
         let spawn_type = ev.spawn_type;
         let pkg = ev.pkg;
 
-        let now = Instant::now();
-        let now_epoch = Self::get_epoch_ms();
         let initial_rss_kb = read_statm_rss_kb(pid, self.page_size_kb);
 
         let is_fg = self.current_fg.as_deref() == Some(pkg);
@@ -747,7 +745,7 @@ impl DaemonState {
 
         // Respawn tracking (proc_died -> proc_start within 120s)
         if let Some(death_time) = self.recent_deaths.remove(pkg) {
-            let gap_ms = now.duration_since(death_time).as_millis() as u64;
+            let gap_ms = now_epoch.saturating_sub(death_time);
             if gap_ms <= 120_000 {
                 let json = format!(
                     r#"{{"ts":{},"event":"respawn","pkg":"{}","gap_ms":{},"pid":{},"uid":{},"type":"{}"}}"#,
@@ -765,23 +763,19 @@ impl DaemonState {
         }
 
         if uid >= 10000 {
-            self.alive_apps
-                .entry(pkg_owned)
-                .or_insert_with(|| AppRecord { last_active: now });
+            self.alive_apps.entry(pkg_owned).or_insert(now_epoch);
 
             let is_fg_launch = is_fg || ev.spawn_type == "top-activity" || ev.spawn_type == "next-top-activity";
             if !is_fg_launch {
-                self.evaluate_reaping_pipeline();
+                self.evaluate_reaping_pipeline(now_epoch);
             }
         }
     }
 
-    fn on_proc_died(&mut self, ev: &ProcDiedEvent) {
+    fn on_proc_died(&mut self, ev: &ProcDiedEvent, now_epoch: u64) {
         let pid = ev.pid;
 
         if let Some(pkg) = self.pid_to_pkg.remove(&pid) {
-            let now = Instant::now();
-
             if let Some(pids) = self.pkg_to_pids.get_mut(&pkg) {
                 pids.remove(&pid);
                 if pids.is_empty() {
@@ -793,23 +787,21 @@ impl DaemonState {
                 self.session_stats.bg_deaths += 1;
             }
 
-            self.recent_deaths.insert(pkg, now);
+            self.recent_deaths.insert(pkg, now_epoch);
             if self.recent_deaths.len() > 64 {
-                self.recent_deaths.retain(|_, death_time| now.duration_since(*death_time) <= Duration::from_secs(120));
+                self.recent_deaths.retain(|_, death_time| now_epoch.saturating_sub(*death_time) <= 120_000);
             }
         }
     }
 
-    fn on_screen_toggled(&mut self, state: bool) {
+    fn on_screen_toggled(&mut self, state: bool, now_epoch: u64) {
         if self.screen_on == state {
             return;
         }
 
-        let now = Instant::now();
-        let now_epoch = Self::get_epoch_ms();
         if !state {
             let active_sec = self.screen_on_start
-                .map(|s| now.duration_since(s).as_secs())
+                .map(|s| now_epoch.saturating_sub(s) / 1000)
                 .unwrap_or(0);
             let json = format!(
                 r#"{{"ts":{},"event":"screen_state","state":"OFF","active_duration_sec":{}}}"#,
@@ -827,10 +819,10 @@ impl DaemonState {
 
             self.screen_on = false;
             self.screen_on_start = None;
-            self.screen_off_start = Some(now);
+            self.screen_off_start = Some(now_epoch);
         } else {
             let duration_sec = self.screen_off_start
-                .map(|s| now.duration_since(s).as_secs())
+                .map(|s| now_epoch.saturating_sub(s) / 1000)
                 .unwrap_or(0);
             let json = format!(
                 r#"{{"ts":{},"event":"screen_state","state":"ON","off_duration_sec":{}}}"#,
@@ -847,15 +839,24 @@ impl DaemonState {
             self.emit_bg_summary(now_epoch, duration_sec);
 
             self.screen_on = true;
-            self.screen_on_start = Some(now);
+            self.screen_on_start = Some(now_epoch);
             self.screen_off_start = None;
         }
     }
 
-    fn evaluate_reaping_pipeline(&mut self) {
-        let now = Instant::now();
-        let now_epoch = Self::get_epoch_ms();
+    /// Kill-decision telemetry naming, shared by the dispatch path and its test.
+    /// Returns `(json_event, columnar_tag, detail_suffix, spawn_skipped)`.
+    fn kill_telemetry_parts(act_mode: bool, ams_protected: bool) -> (&'static str, &'static str, &'static str, bool) {
+        let (event_name, tag, sim_suffix) = match (act_mode, ams_protected) {
+            (true, false) => ("kill", "KILL", ""),
+            (true, true) => ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)"),
+            (false, false) => ("simulated_kill", "SIM_KILL", " (simulated)"),
+            (false, true) => ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)"),
+        };
+        (event_name, tag, sim_suffix, !act_mode || ams_protected)
+    }
 
+    fn evaluate_reaping_pipeline(&mut self, now_epoch: u64) {
         let is_game = self.current_fg.as_ref().map(|p| self.games.contains(p)).unwrap_or(false);
         let is_low_mem = check_mem_critical(self.config.mem_critical_percent);
 
@@ -865,29 +866,29 @@ impl DaemonState {
             self.config.lru_protect_depth
         };
 
-        let t_idle_effective = if is_game || is_low_mem {
-            Duration::from_secs(10)
+        let t_idle_effective_sec: u64 = if is_game || is_low_mem {
+            10
         } else if !self.screen_on && self.config.screen_off_harvest {
-            let off_dur = self
+            let off_dur_sec = self
                 .screen_off_start
-                .map(|s| now.duration_since(s))
+                .map(|s| now_epoch.saturating_sub(s) / 1000)
                 .unwrap_or_default();
-            if off_dur > Duration::from_secs(60) {
-                Duration::from_secs(30)
+            if off_dur_sec > 60 {
+                30
             } else {
-                Duration::from_secs(60)
+                60
             }
         } else {
-            let fg_dur = self
+            let fg_dur_sec = self
                 .current_fg
                 .as_deref()
                 .and_then(|p| self.alive_apps.get(p))
-                .map(|r| now.duration_since(r.last_active))
+                .map(|&anchor| now_epoch.saturating_sub(anchor) / 1000)
                 .unwrap_or_default();
-            if fg_dur > Duration::from_secs(300) {
-                Duration::from_secs(60)
+            if fg_dur_sec > 300 {
+                60
             } else {
-                Duration::from_secs(self.config.t_idle_sec)
+                self.config.t_idle_sec
             }
         };
 
@@ -895,7 +896,7 @@ impl DaemonState {
         let mut dead_pids = Vec::new();
         let mut dead_pkgs = Vec::new();
 
-        for (pkg, record) in &self.alive_apps {
+        for (pkg, &last_active) in &self.alive_apps {
             if self.is_excluded(pkg) {
                 continue;
             }
@@ -905,8 +906,8 @@ impl DaemonState {
                 continue;
             }
 
-            let idle_duration = now.duration_since(record.last_active);
-            if idle_duration < t_idle_effective {
+            let idle_sec = now_epoch.saturating_sub(last_active) / 1000;
+            if idle_sec < t_idle_effective_sec {
                 continue;
             }
 
@@ -933,7 +934,7 @@ impl DaemonState {
                 pkg: pkg.clone(),
                 live_pids,
                 total_rss_kb,
-                idle_sec: idle_duration.as_secs(),
+                idle_sec,
                 lru_pos,
             });
         }
@@ -984,18 +985,13 @@ impl DaemonState {
                         .is_ok()
             });
 
-            let (event_name, tag, sim_suffix) = match (self.act_mode, ams_protected) {
-                (true, false) => ("kill", "KILL", ""),
-                (true, true) => ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)"),
-                (false, false) => ("simulated_kill", "SIM_KILL", " (simulated)"),
-                (false, true) => ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)"),
-            };
+            let (event_name, tag, sim_suffix, spawn_skipped) =
+                Self::kill_telemetry_parts(self.act_mode, ams_protected);
 
             let spawned_val = match is_spawned {
                 Some(v) => if v { "true" } else { "false" },
                 None => "null",
             };
-            let spawn_skipped = !self.act_mode || ams_protected;
             let json = format!(
                 r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
                 now_epoch, event_name, escape_json(&cand.pkg), cand.live_pids, cand.total_rss_kb, reason, cand.idle_sec, cand.lru_pos, spawned_val, oom_adj, ams_protected, spawn_skipped
@@ -1015,8 +1011,8 @@ impl DaemonState {
             self.telemetry.flush();
 
             if ams_protected {
-                if let Some(rec) = self.alive_apps.get_mut(&cand.pkg) {
-                    rec.last_active = now;
+                if let Some(anchor) = self.alive_apps.get_mut(&cand.pkg) {
+                    *anchor = now_epoch;
                 }
             } else {
                 self.alive_apps.remove(&cand.pkg);
@@ -1054,7 +1050,7 @@ impl DaemonState {
         }
 
         if !self.telemetry.json_stdout {
-            println!("{:<12}   {:<12} {:<26} {}", "# TIME", "EVENT", "TARGET", "DETAIL / REASON");
+            println!("{:<12}   {:<12} {:<26} DETAIL / REASON", "# TIME", "EVENT", "TARGET");
             println!("{}", "-".repeat(80));
         }
 
@@ -1082,9 +1078,9 @@ impl DaemonState {
 
             self.reap_terminated_children();
 
-            for i in 0..nfds as usize {
-                let token = events[i].u64;
-                let revents = events[i].events;
+            for ev in events.iter().take(nfds as usize) {
+                let token = ev.u64;
+                let revents = ev.events;
 
                 match token {
                     TOKEN_LOGCAT_PIPE => {
@@ -1184,16 +1180,68 @@ impl DaemonState {
         self.telemetry.flush();
     }
 
+    /// Signed wall-clock step between two consecutive samples, or 0 for a continuous stream.
+    ///
+    /// Only genuine `settimeofday()`/NTP steps qualify: a backward step, or the one-time
+    /// forward jump out of the pre-sync boot RTC band. Ordinary quiet gaps between events
+    /// (reading, screen off, Doze) are real elapsed time and must always yield 0. A `0`
+    /// `prev_epoch` means the clock was unavailable at bootstrap and yields 0.
+    ///
+    /// Known limitation: a *forward* step whose starting value is already at or above
+    /// `RTC_SYNC_FLOOR_MS` is indistinguishable from a quiet gap and returns 0. Only the
+    /// magnitude is observable, and a legitimate Doze gap can be arbitrarily large, so any
+    /// threshold that caught such a step would also freeze real idle age. Anchors are
+    /// therefore assumed to be stamped from a clock that is either correct or pre-2020.
+    #[inline(always)]
+    fn clock_jump_ms(prev_epoch: u64, now_epoch: u64) -> i64 {
+        if prev_epoch == 0 {
+            0
+        } else if now_epoch < prev_epoch {
+            -((prev_epoch - now_epoch) as i64)
+        } else if prev_epoch < RTC_SYNC_FLOOR_MS && now_epoch >= RTC_SYNC_FLOOR_MS {
+            (now_epoch - prev_epoch) as i64
+        } else {
+            0
+        }
+    }
+
+    /// Shifts every stored timestamp anchor by a detected clock step, so elapsed ages
+    /// (idle, respawn TTL, screen-state, game session, summary interval) survive the
+    /// correction unchanged. Records are never re-derived from the wall clock elsewhere.
+    fn apply_clock_jump(&mut self, jump_ms: i64) {
+        if jump_ms == 0 {
+            return;
+        }
+        for anchor in self.alive_apps.values_mut() {
+            *anchor = anchor.saturating_add_signed(jump_ms);
+        }
+        for death in self.recent_deaths.values_mut() {
+            *death = death.saturating_add_signed(jump_ms);
+        }
+        for anchor in [
+            &mut self.screen_on_start,
+            &mut self.screen_off_start,
+            &mut self.game_session_start,
+        ] {
+            *anchor = anchor.map(|t| t.saturating_add_signed(jump_ms));
+        }
+        self.session_start = self.session_start.saturating_add_signed(jump_ms);
+    }
+
     fn dispatch_logcat_line(&mut self, line: &str) {
-        if let Some(event) = parse_logcat_line(line) {
+        if let Some((now_epoch, event)) = parse_logcat_line(line) {
+            // Wall-clock step compensation: shift all anchors together, keep event ts as-is.
+            self.apply_clock_jump(Self::clock_jump_ms(self.last_event_epoch, now_epoch));
+            self.last_event_epoch = now_epoch;
+
             match event {
-                LogcatEvent::ResumeActivity(ev) => self.on_resume_activity(&ev),
-                LogcatEvent::ProcStart(ev) => self.on_proc_start(&ev),
-                LogcatEvent::ProcDied(ev) => self.on_proc_died(&ev),
-                LogcatEvent::ScreenToggled(state) => self.on_screen_toggled(state),
+                LogcatEvent::ResumeActivity(ev) => self.on_resume_activity(&ev, now_epoch),
+                LogcatEvent::ProcStart(ev) => self.on_proc_start(&ev, now_epoch),
+                LogcatEvent::ProcDied(ev) => self.on_proc_died(&ev, now_epoch),
+                LogcatEvent::ScreenToggled(state) => self.on_screen_toggled(state, now_epoch),
                 LogcatEvent::DeviceIdleLightStep => {
                     if !self.screen_on && self.config.screen_off_harvest {
-                        self.evaluate_reaping_pipeline();
+                        self.evaluate_reaping_pipeline(now_epoch);
                     }
                 }
             }
@@ -1313,109 +1361,38 @@ mod tests {
     }
 
     #[test]
-    fn test_ams_protected_telemetry_format() {
-        let pkg = "com.spotify.music";
-        let pids = vec![12345, 12346];
-        let total_rss_kb = 312000u64;
-        let idle_sec = 185u64;
-        let lru_pos = 4usize;
-        let oom_adj = 200i32;
-        let min_oom_score_adj = 900i32;
-        let ams_protected = oom_adj < min_oom_score_adj;
-        assert!(ams_protected);
-
-        // Case 1: Observe mode with ams_protected = true
-        {
-            let act_mode = false;
-            let is_spawned: Option<bool> = None;
-            let (event_name, tag, sim_suffix) = match (act_mode, ams_protected) {
-                (true, false) => ("kill", "KILL", ""),
-                (true, true) => ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)"),
-                (false, false) => ("simulated_kill", "SIM_KILL", " (simulated)"),
-                (false, true) => ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)"),
-            };
-            let spawned_val = match is_spawned {
-                Some(v) => if v { "true" } else { "false" },
-                None => "null",
-            };
-            let spawn_skipped = !act_mode || ams_protected;
-
-            let json = format!(
-                r#"{{"ts":1000,"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"idle_expired","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
-                event_name, pkg, pids, total_rss_kb, idle_sec, lru_pos, spawned_val, oom_adj, ams_protected, spawn_skipped
-            );
-            assert_eq!(tag, "SIM_KILL");
-            assert_eq!(sim_suffix, " (simulated, ams_protected: spawn skipped)");
-            assert!(json.contains(r#""ams_protected":true"#));
-            assert!(json.contains(r#""spawn_skipped":true"#));
-            assert!(json.contains(r#""spawned":null"#));
-            assert!(json.contains(r#""event":"simulated_kill""#));
-        }
-
-        // Case 2: Act mode with ams_protected = true (spawn should be skipped!)
-        {
-            let act_mode = true;
-            let is_spawned: Option<bool> = if ams_protected { Some(false) } else { Some(true) };
-            let (event_name, tag, sim_suffix) = match (act_mode, ams_protected) {
-                (true, false) => ("kill", "KILL", ""),
-                (true, true) => ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)"),
-                (false, false) => ("simulated_kill", "SIM_KILL", " (simulated)"),
-                (false, true) => ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)"),
-            };
-            let spawned_val = match is_spawned {
-                Some(v) => if v { "true" } else { "false" },
-                None => "null",
-            };
-            let spawn_skipped = !act_mode || ams_protected;
-
-            let json = format!(
-                r#"{{"ts":1000,"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"idle_expired","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
-                event_name, pkg, pids, total_rss_kb, idle_sec, lru_pos, spawned_val, oom_adj, ams_protected, spawn_skipped
-            );
-            assert_eq!(tag, "KILL_SKIP");
-            assert_eq!(sim_suffix, " (ams_protected: spawn skipped)");
-            assert!(json.contains(r#""ams_protected":true"#));
-            assert!(json.contains(r#""spawn_skipped":true"#));
-            assert!(json.contains(r#""spawned":false"#));
-            assert!(json.contains(r#""event":"kill_skipped""#));
-        }
+    fn test_kill_telemetry_parts() {
+        assert_eq!(DaemonState::kill_telemetry_parts(true, false), ("kill", "KILL", "", false));
+        assert_eq!(
+            DaemonState::kill_telemetry_parts(true, true),
+            ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)", true)
+        );
+        assert_eq!(
+            DaemonState::kill_telemetry_parts(false, false),
+            ("simulated_kill", "SIM_KILL", " (simulated)", true)
+        );
+        assert_eq!(
+            DaemonState::kill_telemetry_parts(false, true),
+            ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)", true)
+        );
     }
 
     #[test]
     fn test_ams_protected_alive_apps_lifecycle() {
-        let mut alive_apps: FastMap<String, AppRecord> = FastMap::default();
-        let old_time = Instant::now() - Duration::from_secs(300);
-        alive_apps.insert("com.spotify.music".to_string(), AppRecord { last_active: old_time });
-        alive_apps.insert("org.mozilla.firefox".to_string(), AppRecord { last_active: old_time });
+        let mut alive_apps: FastMap<String, u64> = FastMap::default();
+        let old_time = 1_000_000u64;
+        alive_apps.insert("com.spotify.music".to_string(), old_time);
+        alive_apps.insert("org.mozilla.firefox".to_string(), old_time);
 
-        let now = Instant::now();
+        let now = 1_300_000u64;
 
-        // Spotify is ams_protected (e.g. oom_adj = 200 < 900)
-        let spotify_protected = true;
-        if spotify_protected {
-            if let Some(rec) = alive_apps.get_mut("com.spotify.music") {
-                rec.last_active = now;
-            }
-        } else {
-            alive_apps.remove("com.spotify.music");
-        }
+        // Spotify is ams_protected (e.g. oom_adj = 200 < 900): anchor refreshed, not removed.
+        *alive_apps.get_mut("com.spotify.music").unwrap() = now;
 
-        // Firefox is NOT protected (e.g. oom_adj = 900 >= 900)
-        let firefox_protected = false;
-        if firefox_protected {
-            if let Some(rec) = alive_apps.get_mut("org.mozilla.firefox") {
-                rec.last_active = now;
-            }
-        } else {
-            alive_apps.remove("org.mozilla.firefox");
-        }
+        // Firefox is NOT protected (e.g. oom_adj = 900 >= 900): killed and dropped.
+        alive_apps.remove("org.mozilla.firefox");
 
-        // Verify Spotify remains in alive_apps with refreshed last_active
-        assert!(alive_apps.contains_key("com.spotify.music"));
-        let spotify_rec = alive_apps.get("com.spotify.music").unwrap();
-        assert!(spotify_rec.last_active >= now);
-
-        // Verify Firefox is evicted from alive_apps
+        assert_eq!(alive_apps.get("com.spotify.music"), Some(&now));
         assert!(!alive_apps.contains_key("org.mozilla.firefox"));
     }
 
@@ -1461,5 +1438,95 @@ mod tests {
         assert_eq!(parse_dumpsys_power_screen("PowerManagerService is dead"), None);
         assert_eq!(parse_dumpsys_power_screen(""), None);
     }
-}
 
+    #[test]
+    fn test_clock_jump_ms() {
+        // First event after bootstrap: no previous sample, nothing to compensate.
+        assert_eq!(DaemonState::clock_jump_ms(0, 1_700_000_000_000), 0);
+
+        // Quiet periods are real elapsed time, never a clock step (regression guard).
+        assert_eq!(DaemonState::clock_jump_ms(1_700_000_000_000, 1_700_000_060_000), 0);
+        assert_eq!(DaemonState::clock_jump_ms(1_700_000_000_000, 1_800_000_000_000), 0);
+        assert_eq!(DaemonState::clock_jump_ms(1_700_000_000_000, 1_700_000_000_000), 0);
+
+        // Backward settimeofday() correction of 10s.
+        assert_eq!(DaemonState::clock_jump_ms(1_700_000_010_000, 1_700_000_000_000), -10_000);
+
+        // Unsynchronized boot RTC jumping forward to NTP-synced time.
+        assert_eq!(
+            DaemonState::clock_jump_ms(15_000, 1_700_000_000_000),
+            1_699_999_985_000
+        );
+    }
+
+    /// Test-only `DaemonState` with inert descriptors and a throwaway telemetry file,
+    /// so the anchor-rebasing paths can be exercised without spawning `logcat`.
+    fn daemon_for_test(tag: &str, bootstrap_epoch: u64) -> DaemonState {
+        let log_path =
+            std::env::temp_dir().join(format!("mlmk_test_{}_{}.log", std::process::id(), tag));
+        DaemonState {
+            config: RuntimeConfig::default(),
+            json_stdout: false,
+            alive_apps: FastMap::default(),
+            pid_to_pkg: FastMap::default(),
+            pkg_to_pids: FastMap::default(),
+            pkg_to_uid: FastMap::default(),
+            recent_deaths: FastMap::default(),
+            user_exclusions: FastSet::default(),
+            games: FastSet::default(),
+            dynamic_exclusions: FastSet::default(),
+            fg_lru: VecDeque::default(),
+            telemetry: TelemetrySink::new(&log_path.to_string_lossy(), false),
+            logcat_child: None,
+            current_fg: None,
+            screen_on_start: Some(bootstrap_epoch),
+            screen_off_start: None,
+            game_session_start: None,
+            session_start: bootstrap_epoch,
+            last_event_epoch: bootstrap_epoch,
+            session_stats: SessionStats::default(),
+            page_size_kb: 4,
+            epoll_fd: -1,
+            logcat_fd: -1,
+            inotify_fd: -1,
+            game_intrusion_count: 0,
+            screen_on: true,
+            is_gaming: false,
+            act_mode: true,
+        }
+    }
+
+    #[test]
+    fn test_bootstrap_clock_step_rebases_bootstrap_anchors() {
+        // A dead coin cell leaves the RTC in the pre-2020 band; the first event of the
+        // stream arrives after the clock has been corrected. Anchors stamped from the boot
+        // clock have to be rebased, or every interval derived from them spans decades.
+        let boot_ms = 1_234_567_890_000u64; // 2009, below RTC_SYNC_FLOOR_MS
+        let first_event_ms = 1_777_998_045_123u64; // post-sync
+        let idle = "com.example.idle";
+        let mut d = daemon_for_test("bootstep", boot_ms);
+        d.alive_apps.insert(idle.into(), boot_ms);
+        d.recent_deaths.insert("com.example.dead".into(), boot_ms);
+
+        let jump = DaemonState::clock_jump_ms(d.last_event_epoch, first_event_ms);
+        assert!(jump > 0, "pre-sync boot stamp is not a quiet gap");
+        d.apply_clock_jump(jump);
+
+        // Bootstrap-stamped ages collapse to ~0 instead of ~56 years.
+        assert_eq!(d.session_start, first_event_ms);
+        assert_eq!(d.screen_on_start, Some(first_event_ms));
+        assert_eq!(d.alive_apps[idle], first_event_ms);
+        assert_eq!(d.recent_deaths["com.example.dead"], first_event_ms);
+
+        // A correct boot clock followed by an ordinary quiet gap stays untouched.
+        let mut d2 = daemon_for_test("bootsync", first_event_ms);
+        d2.alive_apps.insert(idle.into(), first_event_ms);
+        let later = first_event_ms + 3_600_000;
+        let jump2 = DaemonState::clock_jump_ms(d2.last_event_epoch, later);
+        assert_eq!(jump2, 0, "silence is elapsed time, not a step");
+        d2.apply_clock_jump(jump2);
+        assert_eq!(d2.session_start, first_event_ms);
+        assert_eq!(d2.screen_on_start, Some(first_event_ms));
+        assert_eq!(later - d2.alive_apps[idle], 3_600_000);
+    }
+}
