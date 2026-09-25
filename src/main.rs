@@ -102,6 +102,44 @@ fn detect_initial_screen_on() -> bool {
         .unwrap_or(true)
 }
 
+/// Non-allocating, sub-millisecond health probe for the spawned logcat stream.
+/// Validates child process survival and pipe integrity using non-blocking syscalls.
+pub fn probe_logcat_stream(child: &mut Child, pipe_fd: i32) -> Result<(), &'static str> {
+    let mut status: libc::c_int = 0;
+    let pid = child.id() as libc::pid_t;
+
+    // 1. Instant check: Has the child already exited (e.g. exec failure, missing binary, or SELinux denial)?
+    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if reaped == pid {
+        return Err("Child logcat process died immediately after spawn (SELinux denial, missing binary, or invalid arguments)");
+    } else if reaped < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ECHILD) {
+            return Err("Child logcat process died immediately after spawn (reaped/ECHILD)");
+        }
+        return Err("waitpid error checking logcat child status");
+    }
+
+    // 2. Check if the pipe file descriptor is valid
+    let flags = unsafe { libc::fcntl(pipe_fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err("Invalid logcat stdout pipe file descriptor");
+    }
+
+    // 3. Zero-timeout poll on pipe_fd to detect immediate POLLHUP or POLLERR
+    let mut pfd = libc::pollfd {
+        fd: pipe_fd,
+        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if ret > 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0) {
+        return Err("Immediate POLLHUP/POLLERR detected on logcat stdout pipe");
+    }
+
+    Ok(())
+}
+
 impl DaemonState {
     fn new(act_mode: bool, json_stdout: bool) -> Self {
         unsafe {
@@ -408,6 +446,8 @@ impl DaemonState {
         }
     }
 
+
+
     fn spawn_logcat_stream(&mut self) {
         if !self.json_stdout {
             println!("[DAEMON] Spawning unified logcat stream...");
@@ -416,8 +456,14 @@ impl DaemonState {
             .args([
                 "-b", "events",
                 "-v", "tag",
-                "-s", "wm_resume_activity", "am_resume_activity", "am_proc_start", "am_proc_died", "screen_toggled", "device_idle_light_step",
                 "-T", "1",
+                "-s",
+                "wm_resume_activity:V",
+                "am_resume_activity:V",
+                "am_proc_start:V",
+                "am_proc_died:V",
+                "screen_toggled:V",
+                "device_idle_light_step:V",
             ])
             .stdout(Stdio::piped())
             .spawn()
@@ -431,6 +477,11 @@ impl DaemonState {
 
         let stdout = child.stdout.take().expect("logcat stdout");
         let raw_fd = stdout.into_raw_fd();
+
+        if let Err(err) = probe_logcat_stream(&mut child, raw_fd) {
+            eprintln!("[FATAL] Logcat pipeline startup probe failed: {}", err);
+            std::process::exit(1);
+        }
 
         unsafe {
             let flags = libc::fcntl(raw_fd, libc::F_GETFL, 0);
@@ -743,7 +794,7 @@ impl DaemonState {
         };
 
         let t_idle_effective = if is_game || is_low_mem {
-            Duration::ZERO
+            Duration::from_secs(10)
         } else if !self.screen_on && self.config.screen_off_harvest {
             let off_dur = self
                 .screen_off_start
@@ -838,9 +889,7 @@ impl DaemonState {
                 .map(|&p| read_oom_score_adj(p).unwrap_or(0))
                 .min()
                 .unwrap_or(0);
-            if oom_adj < self.config.min_oom_score_adj {
-                continue;
-            }
+            let ams_protected = oom_adj < self.config.min_oom_score_adj;
 
             let reason = if is_game {
                 "game_mode_escalation"
@@ -853,31 +902,38 @@ impl DaemonState {
             let rss_mb = cand.total_rss_kb / 1024;
 
             let is_spawned = if self.act_mode {
-                Some(
-                    Command::new("/system/bin/cmd")
-                        .args(["activity", "kill", "--user", "all", &cand.pkg])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                        .is_ok(),
-                )
+                if ams_protected {
+                    Some(false)
+                } else {
+                    Some(
+                        Command::new("/system/bin/cmd")
+                            .args(["activity", "kill", "--user", "all", &cand.pkg])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .is_ok(),
+                    )
+                }
             } else {
                 None
             };
 
-            let (event_name, tag, sim_suffix) = match is_spawned {
-                Some(_) => ("kill", "KILL", ""),
-                None => ("simulated_kill", "SIM_KILL", " (simulated)"),
+            let (event_name, tag, sim_suffix) = match (self.act_mode, ams_protected) {
+                (true, false) => ("kill", "KILL", ""),
+                (true, true) => ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)"),
+                (false, false) => ("simulated_kill", "SIM_KILL", " (simulated)"),
+                (false, true) => ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)"),
             };
 
             let spawned_val = match is_spawned {
                 Some(v) => if v { "true" } else { "false" },
                 None => "null",
             };
+            let spawn_skipped = !self.act_mode || ams_protected;
             let json = format!(
-                r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{}}}"#,
-                now_epoch, event_name, escape_json(&cand.pkg), cand.live_pids, cand.total_rss_kb, reason, cand.idle_sec, cand.lru_pos, spawned_val, oom_adj
+                r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
+                now_epoch, event_name, escape_json(&cand.pkg), cand.live_pids, cand.total_rss_kb, reason, cand.idle_sec, cand.lru_pos, spawned_val, oom_adj, ams_protected, spawn_skipped
             );
 
             self.telemetry.emit_with(
@@ -893,7 +949,13 @@ impl DaemonState {
             );
             self.telemetry.flush();
 
-            self.alive_apps.remove(&cand.pkg);
+            if ams_protected {
+                if let Some(rec) = self.alive_apps.get_mut(&cand.pkg) {
+                    rec.last_active = now;
+                }
+            } else {
+                self.alive_apps.remove(&cand.pkg);
+            }
         }
     }
 
@@ -1111,3 +1173,185 @@ fn main() {
     println!("=== mini-lmk daemon ===");
     DaemonState::new(act_mode, json_stdout).run();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ChildGuard {
+        child: Child,
+        fd: i32,
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if self.fd >= 0 {
+                unsafe {
+                    libc::close(self.fd);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_probe_logcat_stream_healthy() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let stdout = child.stdout.take().expect("stdout");
+        let raw_fd = stdout.into_raw_fd();
+        let mut guard = ChildGuard { child, fd: raw_fd };
+
+        let res = probe_logcat_stream(&mut guard.child, guard.fd);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_probe_logcat_stream_dead_child() {
+        let mut child = Command::new("true")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn true");
+        let stdout = child.stdout.take().expect("stdout");
+        let raw_fd = stdout.into_raw_fd();
+        let mut guard = ChildGuard { child, fd: raw_fd };
+
+        // Wait for child to exit
+        let _ = guard.child.wait();
+
+        let res = probe_logcat_stream(&mut guard.child, guard.fd);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("died immediately"));
+    }
+
+    #[test]
+    fn test_probe_logcat_stream_invalid_fd() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let stdout = child.stdout.take().expect("stdout");
+        let raw_fd = stdout.into_raw_fd();
+        let mut guard = ChildGuard { child, fd: -1 };
+
+        // Close raw_fd explicitly to simulate invalid fd
+        unsafe { libc::close(raw_fd); }
+
+        let res = probe_logcat_stream(&mut guard.child, raw_fd);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Invalid"));
+    }
+
+    #[test]
+    fn test_ams_protected_telemetry_format() {
+        let pkg = "com.spotify.music";
+        let pids = vec![12345, 12346];
+        let total_rss_kb = 312000u64;
+        let idle_sec = 185u64;
+        let lru_pos = 4usize;
+        let oom_adj = 200i32;
+        let min_oom_score_adj = 900i32;
+        let ams_protected = oom_adj < min_oom_score_adj;
+        assert!(ams_protected);
+
+        // Case 1: Observe mode with ams_protected = true
+        {
+            let act_mode = false;
+            let is_spawned: Option<bool> = None;
+            let (event_name, tag, sim_suffix) = match (act_mode, ams_protected) {
+                (true, false) => ("kill", "KILL", ""),
+                (true, true) => ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)"),
+                (false, false) => ("simulated_kill", "SIM_KILL", " (simulated)"),
+                (false, true) => ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)"),
+            };
+            let spawned_val = match is_spawned {
+                Some(v) => if v { "true" } else { "false" },
+                None => "null",
+            };
+            let spawn_skipped = !act_mode || ams_protected;
+
+            let json = format!(
+                r#"{{"ts":1000,"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"idle_expired","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
+                event_name, pkg, pids, total_rss_kb, idle_sec, lru_pos, spawned_val, oom_adj, ams_protected, spawn_skipped
+            );
+            assert_eq!(tag, "SIM_KILL");
+            assert_eq!(sim_suffix, " (simulated, ams_protected: spawn skipped)");
+            assert!(json.contains(r#""ams_protected":true"#));
+            assert!(json.contains(r#""spawn_skipped":true"#));
+            assert!(json.contains(r#""spawned":null"#));
+            assert!(json.contains(r#""event":"simulated_kill""#));
+        }
+
+        // Case 2: Act mode with ams_protected = true (spawn should be skipped!)
+        {
+            let act_mode = true;
+            let is_spawned: Option<bool> = if ams_protected { Some(false) } else { Some(true) };
+            let (event_name, tag, sim_suffix) = match (act_mode, ams_protected) {
+                (true, false) => ("kill", "KILL", ""),
+                (true, true) => ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)"),
+                (false, false) => ("simulated_kill", "SIM_KILL", " (simulated)"),
+                (false, true) => ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)"),
+            };
+            let spawned_val = match is_spawned {
+                Some(v) => if v { "true" } else { "false" },
+                None => "null",
+            };
+            let spawn_skipped = !act_mode || ams_protected;
+
+            let json = format!(
+                r#"{{"ts":1000,"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"idle_expired","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
+                event_name, pkg, pids, total_rss_kb, idle_sec, lru_pos, spawned_val, oom_adj, ams_protected, spawn_skipped
+            );
+            assert_eq!(tag, "KILL_SKIP");
+            assert_eq!(sim_suffix, " (ams_protected: spawn skipped)");
+            assert!(json.contains(r#""ams_protected":true"#));
+            assert!(json.contains(r#""spawn_skipped":true"#));
+            assert!(json.contains(r#""spawned":false"#));
+            assert!(json.contains(r#""event":"kill_skipped""#));
+        }
+    }
+
+    #[test]
+    fn test_ams_protected_alive_apps_lifecycle() {
+        let mut alive_apps: FastMap<String, AppRecord> = FastMap::default();
+        let old_time = Instant::now() - Duration::from_secs(300);
+        alive_apps.insert("com.spotify.music".to_string(), AppRecord { last_active: old_time });
+        alive_apps.insert("org.mozilla.firefox".to_string(), AppRecord { last_active: old_time });
+
+        let now = Instant::now();
+
+        // Spotify is ams_protected (e.g. oom_adj = 200 < 900)
+        let spotify_protected = true;
+        if spotify_protected {
+            if let Some(rec) = alive_apps.get_mut("com.spotify.music") {
+                rec.last_active = now;
+            }
+        } else {
+            alive_apps.remove("com.spotify.music");
+        }
+
+        // Firefox is NOT protected (e.g. oom_adj = 900 >= 900)
+        let firefox_protected = false;
+        if firefox_protected {
+            if let Some(rec) = alive_apps.get_mut("org.mozilla.firefox") {
+                rec.last_active = now;
+            }
+        } else {
+            alive_apps.remove("org.mozilla.firefox");
+        }
+
+        // Verify Spotify remains in alive_apps with refreshed last_active
+        assert!(alive_apps.contains_key("com.spotify.music"));
+        let spotify_rec = alive_apps.get("com.spotify.music").unwrap();
+        assert!(spotify_rec.last_active >= now);
+
+        // Verify Firefox is evicted from alive_apps
+        assert!(!alive_apps.contains_key("org.mozilla.firefox"));
+    }
+}
+

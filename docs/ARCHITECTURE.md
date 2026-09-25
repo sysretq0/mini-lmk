@@ -170,15 +170,16 @@ Reap Evaluation Triggers:
           │
           ├── [Check 1] In static/dynamic exclusions? ────────► SKIP (Protected Role / Exclude)
           ├── [Check 2] Position in fg_lru < effective_lru? ──► SKIP (Active App Protection)
-          ├── [Check 3] (Instant::now() - last_active) < T_idle? ► SKIP (Young / Warm App)
-          ├── [Check 4] min(oom_score_adj) < min_oom_score_adj? ─► SKIP (Active / Service Process)
+          └── [Check 3] (Instant::now() - last_active) < T_idle? ► SKIP (Young / Warm App)
           │
           ▼
       [Eviction Candidates Identified]
           │
           ├── Targeted Read: Parse RSS from /proc/<pid>/statm for qualified candidates only
           ├── Sort candidates descending by RSS (heaviest footprint first)
-          └── Execute: cmd activity kill --user all <pkg>
+          ├── [Gate 4] min(oom_score_adj) < min_oom_score_adj?
+          │            ├── YES: Mark ams_protected, skip spawn, refresh last_active, emit telemetry
+          │            └── NO:  Execute cmd activity kill --user all <pkg>, purge alive_apps
 ```
 
 ### 3.1 Multi-Gate Rules
@@ -196,9 +197,10 @@ Reap Evaluation Triggers:
 
 3. **OOM Score Qualification Gate (`min_oom_score_adj`):**
    * The daemon queries `/proc/<pid>/oom_score_adj` for every live PID belonging to the candidate package.
-   * If `min(oom_score_adj) < min_oom_score_adj`, the entire package is shielded and skipped.
+   * If `min(oom_score_adj) < min_oom_score_adj`, the package is identified as `ams_protected`. The daemon skips the process spawn (`cmd activity kill`) to eliminate wasted fork/exec overhead and futile AMS rejections, while preserving full telemetry visibility across `--observe` and `--act` modes (`ams_protected: true`, `spawn_skipped: true`).
+   * The package's `last_active` timestamp is refreshed in `alive_apps`, yielding the eviction slot to subsequent candidates on future ticks while maintaining a periodic audit heartbeat every `T_idle`.
    * Tunable in `daemon.conf` between `500` and `900` (default: `900`):
-     * `900` (Conservative): Restricts evictions strictly to cached/idle processes (`CACHED_APP_MIN_ADJ = 900`). shielding processes with `oom_score_adj < 900` (e.g., active background services, audio players, background downloads).
+     * `900` (Conservative): Restricts evictions strictly to cached/idle processes (`CACHED_APP_MIN_ADJ = 900`). Shields processes with `oom_score_adj < 900` (e.g., active background services, audio players, background downloads).
      * `500` (Aggressive): Permits eviction of background services down to AOSP's framework limit (`SERVICE_ADJ = 500`). Maximizes reclaimable RAM for gaming or constrained devices.
 
 ### 3.2 Escalation Modes
@@ -310,7 +312,57 @@ The daemon writes structured Newline-Delimited JSON (NDJSON) using standard user
 
 ---
 
-## 6. Licensing & Distribution
+## 6. Empirical Performance & Latency Profile
+
+Measured on physical target environment (Android 14 API 34, Linux kernel 5.10, `aarch64`):
+
+### 6.1 Low-UID System Package Termination: Empirical AMS Verification
+
+To verify the necessity of the `uid >= 10000` fail-closed candidate guard, `cmd activity kill --user 0` was tested directly on Android 14 against running low-UID system packages:
+
+* **Cached System App (`com.android.keychain`, UID 1000):** Backgrounded with `oom_score_adj = 905`. Upon dispatching `cmd activity kill --user 0 com.android.keychain`, AMS immediately terminated the process (PID 29506 died and was purged from the system).
+* **Vendor Daemon (`com.sprd.validationtools`, UID 1000):** Upon dispatching `cmd activity kill`, AMS killed PID 20352 (which immediately triggered a zygote respawn as PID 4788).
+* **Persistent System Service (`com.android.se`, UID 1068):** Running as an active system service with low OOM adj; AMS ignored the kill command (PID 2143 remained alive).
+
+**Conclusion:** Activity Manager Service (AMS) **does kill** low-UID system packages if they reside in cached/background states. Without the daemon's in-memory `uid >= 10000` guard, targeting low-UID packages would terminate critical framework dependencies (e.g., KeyChain or vendor daemons).
+
+### 6.2 Microbenchmark Suite: Kernel-Direct Procfs Latency Distribution
+
+Evaluated via `benches/microbench.rs` across 1,000 warm-up cycles and 10,000 timed iterations, comparing hot-cache self inspection against real-world cold multi-PID pool traversal:
+
+| Target / Operation | Mechanism / Scope | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean | CFS Preemptions |
+|---|---|---|---|---|---|---|---|---|---|
+| `procfs::read_oom_score_adj` | self, hot cache | 10,000 | 2.85 µs | **3.31 µs** | 10.69 µs | 14.15 µs | 531.69 µs | 4.32 µs | 1 |
+| `procfs::read_oom_score_adj` | multi-PID pool (cold) | 10,000 | 4.69 µs | **8.69 µs** | 23.38 µs | 38.15 µs | 999.08 µs | 11.72 µs | 3 |
+| `procfs::read_statm_rss_kb` | self, hot cache | 10,000 | 3.69 µs | **4.23 µs** | 20.31 µs | 40.08 µs | 5.71 ms | 8.86 µs | 4 |
+| `procfs::read_statm_rss_kb` | multi-PID pool (cold) | 10,000 | 5.00 µs | **6.23 µs** | 10.46 µs | 14.77 µs | 450.38 µs | 7.07 µs | 0 |
+| `procfs::read_meminfo_kb` | `/proc/meminfo` | 10,000 | 7.69 µs | **8.00 µs** | 9.46 µs | 12.62 µs | 377.54 µs | 8.50 µs | 0 |
+| `telemetry::FormattedTime` | Stack buffer format | 10,000 | 76.0 ns | **307.0 ns** | 308.0 ns | 308.0 ns | 2.54 µs | 261.3 ns | 0 |
+| `Instant::now` (Overhead) | Timer baseline | 10,000 | 0.0 ns | **231.0 ns** | 385.0 ns | 539.0 ns | 2.38 µs | 226.7 ns | 0 |
+
+#### Architectural Key Takeaways:
+1. **Cold Multi-PID VFS Access:** Cycling through a pool of external PIDs across the system shifts P50 latency from 3.31 µs (self, pinned dcache) to 8.69 µs (external PID, VFS dentry traversal). Even under cold multi-PID access, candidate qualification completes in under **9 microseconds per PID**.
+2. **Tail Latency Root Cause:** Multi-millisecond Max outliers (e.g. 1.2–5.7 ms) were investigated using per-iteration thread CPU tracking (`CLOCK_THREAD_CPUTIME_ID`) and involuntary context switch counters (`ru_nivcsw`). In every outlier instance, actual thread CPU time remained < 50 µs while `ru_nivcsw` incremented, confirming that outliers are caused exclusively by **Linux CFS scheduler preemption**, not kernel VFS stalling.
+
+### 6.3 End-to-End Daemon Benchmarks: Idle vs Active App-Switching Pipeline
+
+Evaluated via `scripts/benchmark.sh` across both steady-state idle conditions ($N = 50$) and active live app-switching workloads ($N = 15$, cycling between Settings, Home, and Browser transitions):
+
+| Metric | Workload Mode | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean |
+|---|---|---|---|---|---|---|---|---|
+| **Cold-start Discovery** | Initial Boot Indexing | 50 | 181.1 ms | **251.6 ms** | 289.6 ms | 343.5 ms | 343.5 ms | 251.6 ms |
+| **Steady-State Memory (PSS)** | Idle Boot State | 50 | 1,081 kB | **1,109 kB** | 1,133 kB | 1,139 kB | 1,139 kB | 1,109 kB |
+| **Active Pipeline Memory (PSS)**| Live App-Switch Traffic | 15 | 1,150 kB | **1,165 kB** | 1,183 kB | 1,183 kB | 1,183 kB | 1,165 kB |
+| **Resident Set Size (RSS)** | Idle Boot State | 50 | 3,744 kB | **3,848 kB** | 3,944 kB | 4,012 kB | 4,012 kB | 3,850 kB |
+| **Resident Set Size (RSS)** | Live App-Switch Traffic | 15 | 3,852 kB | **3,960 kB** | 4,044 kB | 4,044 kB | 4,044 kB | 3,965 kB |
+| **Inter-Event Idle CPU Wakeups** | Post-Traffic Idle Window | 65 | 0 | **0** | 0 | 0 | 0 | 0.0 |
+
+**Pipeline Memory Growth:** Active app-switching with populated `alive_apps`, `fg_lru`, `pkg_to_pids`, and `recent_deaths` tables increases steady-state PSS by only **+56 kB** (from 1,109 kB to 1,165 kB), confirming that the daemon easily remains under its 2.5 MB PSS budget even under heavy transition load. Inter-event wakeups remain strictly **0** once traffic pauses.
+
+---
+
+## 7. Licensing & Distribution
 
 This project is licensed under the **GNU General Public License v3.0** (`GPL-3.0-only`). See the [`LICENSE`](../LICENSE) file for complete terms and legal text.
+
 

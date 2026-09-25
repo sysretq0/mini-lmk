@@ -20,9 +20,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Clean Local Cargo Config
-        run: rm -rf .cargo
-
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -39,20 +36,15 @@ jobs:
           ndk-version: r30
           add-to-path: true
 
+      - name: Add NDK Toolchain to PATH
+        run: |
+          echo "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
       - name: Run Test Suite
         run: cargo test --verbose
 
       - name: Build All Android ABIs
-        env:
-          NDK_TOOLCHAIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
         run: |
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/aarch64-linux-android29-clang"
-          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$NDK_TOOLCHAIN/armv7a-linux-androideabi29-clang"
-          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/x86_64-linux-android29-clang"
-          export CARGO_TARGET_I686_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/i686-linux-android29-clang"
-
-          export RUSTFLAGS="-C link-arg=-Wl,--gc-sections -C link-arg=-Wl,-z,relro,-z,now -C link-arg=-Wl,--as-needed"
-
           echo "=== Building aarch64-linux-android (arm64-v8a) ==="
           cargo build --release --target aarch64-linux-android
 
@@ -77,12 +69,42 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+      - name: Generate Release Notes from CHANGELOG.md
+        if: startsWith(github.ref, 'refs/tags/')
+        id: release-notes
+        run: |
+          python3 -c "
+          import os, re
+          tag = os.environ.get('GITHUB_REF_NAME', '')
+          ver = tag.lstrip('v')
+          repo = os.environ.get('GITHUB_REPOSITORY', '')
+
+          notes = ''
+          if os.path.exists('CHANGELOG.md'):
+              with open('CHANGELOG.md', 'r', encoding='utf-8') as f:
+                  content = f.read()
+              pattern = rf'## \[{re.escape(ver)}\][^\n]*\n(.*?)(?=\n## \[|\Z)'
+              m = re.search(pattern, content, re.DOTALL)
+              if m:
+                  notes = m.group(1).strip()
+
+          changelog_link = f'https://github.com/{repo}/blob/{tag}/CHANGELOG.md'
+          if notes:
+              body = f'{notes}\n\n---\n**Full Changelog**: [{tag} Release Notes]({changelog_link})'
+          else:
+              body = f'See [CHANGELOG.md]({changelog_link}) for details and change history.'
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write('body<<EOF\n' + body + '\nEOF\n')
+          "
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
-          generate_release_notes: true
+          body: ${{ steps.release-notes.outputs.body }}
+          generate_release_notes: false
           draft: false
           prerelease: false
         env:

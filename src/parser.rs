@@ -95,6 +95,11 @@ fn tokenize<'a, const N: usize>(inner: &'a str, out: &mut [&'a str; N]) -> usize
 /// In Android, component names are strictly `<package>/<activity>`.
 /// We scan tokens for the component containing `/`. If no token has `/`,
 /// we fall back to standard positional index (index 3).
+///
+/// Resilient extraction:
+/// - Strips enclosing curly braces `{...}` and whitespace.
+/// - Handles Intent-wrapped components like `{act=... cmp=pkg/act flg=...}`.
+/// - Validates that the package name is non-empty, contains letters, and does not start with hyphens or braces.
 pub fn parse_resume_activity(payload: &str) -> Option<ResumeActivityEvent<'_>> {
     let inner = payload.trim().trim_matches(['[', ']']).trim();
     let mut tokens = [""; 8];
@@ -103,28 +108,56 @@ pub fn parse_resume_activity(payload: &str) -> Option<ResumeActivityEvent<'_>> {
         return None;
     }
 
-    let mut component = "";
+    let mut raw_comp = "";
     for &tok in &tokens[..count] {
         if tok.contains('/') {
-            component = tok;
+            raw_comp = tok;
             break;
         }
     }
 
-    if component.is_empty() && count >= 4 {
-        component = tokens[3];
+    if raw_comp.is_empty() && count >= 4 {
+        raw_comp = tokens[3];
     }
 
-    if component.is_empty() {
+    if raw_comp.is_empty() {
         return None;
     }
 
-    let pkg = component.split('/').next().unwrap_or(component).trim();
-    if pkg.is_empty() || pkg.starts_with('-') {
+    // Strip enclosing braces and whitespace
+    let mut clean_comp = raw_comp.trim().trim_matches(['{', '}']).trim();
+
+    // If wrapped in Intent syntax with "cmp=", extract the component part
+    if let Some(idx) = clean_comp.find("cmp=") {
+        clean_comp = clean_comp[idx + 4..].trim();
+        // cmp is terminated by whitespace, bracket, brace, or end of string
+        if let Some(end_idx) = clean_comp.find(|c: char| c.is_whitespace() || c == '}' || c == ']') {
+            clean_comp = &clean_comp[..end_idx];
+        }
+    } else if clean_comp.contains(' ') {
+        // If not explicit cmp=, but contains whitespace, select the word containing '/'
+        for word in clean_comp.split_whitespace() {
+            if word.contains('/') {
+                clean_comp = word.trim_matches(['{', '}', '"', '\'']);
+                break;
+            }
+        }
+    }
+
+    clean_comp = clean_comp.trim_matches(['{', '}', ' ', '"', '\'']);
+    if clean_comp.is_empty() {
         return None;
     }
 
-    Some(ResumeActivityEvent { pkg, component })
+    let pkg = clean_comp.split('/').next().unwrap_or(clean_comp).trim();
+    if pkg.is_empty() || pkg.starts_with('-') || pkg.starts_with('{') || !pkg.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+
+    Some(ResumeActivityEvent {
+        pkg,
+        component: clean_comp,
+    })
 }
 
 /// Parse `am_proc_start` payloads.
@@ -215,15 +248,42 @@ pub fn parse_proc_start(payload: &str) -> Option<ProcStartEvent<'_>> {
     })
 }
 
+/// Validate whether a token looks like a valid Linux/Android process identifier
+/// (e.g. "com.example.app", "system_server", "zygote64", "com.android.chrome:sandboxed_process0").
+/// Rejects empty strings, strings with spaces (e.g. reasons like "kill background"),
+/// strings starting with hyphens or braces, and purely numeric strings.
+#[inline(always)]
+fn is_proc_name(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let mut has_alpha = false;
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphabetic() {
+            has_alpha = true;
+        } else if !b.is_ascii_digit() && b != b'.' && b != b'_' && b != b':' {
+            return false;
+        }
+    }
+    has_alpha
+}
+
 /// Parse `am_proc_died` payloads.
 ///
 /// Standard AOSP format (API 29–37):
 /// `[<user_id>, <pid>, <process_name>, <oom_adj>, <reason>]`
 /// e.g. `[0,12763,com.google.android.calculator,900,kill background]`
 ///
+/// Legacy/OEM format:
+/// `[<pid>, <process_name>]`
+/// e.g. `[12763,com.example.app]`
+///
 /// Resilient extraction:
-/// - Fast path: tokens[1] = PID.
-/// - Fallback: dynamically locates PID token.
+/// - Fast path: standard AOSP index 1 (PID strictly adjacent to validated process name at index 2).
+/// - Legacy/OEM path: index 0 (PID strictly adjacent to validated process name at index 1).
+/// - Resilient scan: matches a positive numeric token strictly preceding a verified process identifier.
+///   Eliminates naive fallbacks where `oom_adj` or `proc_state` values could be misparsed as PIDs.
 pub fn parse_proc_died(payload: &str) -> Option<ProcDiedEvent> {
     let inner = payload.trim().trim_matches(['[', ']']).trim();
     let mut tokens = [""; 8];
@@ -232,16 +292,24 @@ pub fn parse_proc_died(payload: &str) -> Option<ProcDiedEvent> {
         return None;
     }
 
-    // Fast-path: Standard AOSP index 1
+    // 1. Fast-path: Standard AOSP index 1 ([user, pid, proc_name, ...])
     if let Ok(pid) = tokens[1].parse::<u32>() {
-        if pid > 0 {
+        if pid > 0 && count > 2 && is_proc_name(tokens[2]) {
             return Some(ProcDiedEvent { pid });
         }
     }
 
-    for &tok in tokens[2..count].iter() {
-        if let Ok(pid) = tok.parse::<u32>() {
-            if pid > 0 {
+    // 2. Legacy / 2-token format: [pid, proc_name]
+    if let Ok(pid) = tokens[0].parse::<u32>() {
+        if pid > 0 && is_proc_name(tokens[1]) {
+            return Some(ProcDiedEvent { pid });
+        }
+    }
+
+    // 3. Resilient scan: Candidate PID strictly followed by verified process identifier
+    for i in 0..count.saturating_sub(1) {
+        if let Ok(pid) = tokens[i].parse::<u32>() {
+            if pid > 0 && is_proc_name(tokens[i + 1]) {
                 return Some(ProcDiedEvent { pid });
             }
         }
@@ -392,6 +460,79 @@ mod tests {
         match parse_logcat_line(line) {
             Some(LogcatEvent::ProcDied(ev)) => {
                 assert_eq!(ev.pid, 12763);
+            }
+            other => panic!("Unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_proc_died_comprehensive() {
+        // 1. Standard AOSP: [user, pid, proc_name, oom_adj, proc_state]
+        assert_eq!(
+            parse_proc_died("[0, 12763, com.google.android.calculator, 900, 16]"),
+            Some(ProcDiedEvent { pid: 12763 })
+        );
+
+        // 2. Shifted OEM payload with oom_adj: [0, 12763, com.android.settings, 100, 2]
+        assert_eq!(
+            parse_proc_died("[0, 12763, com.android.settings, 100, 2]"),
+            Some(ProcDiedEvent { pid: 12763 })
+        );
+
+        // 3. Negative OOM adjustment: [0, 1500, system_server, -1000, 0]
+        assert_eq!(
+            parse_proc_died("[0, 1500, system_server, -1000, 0]"),
+            Some(ProcDiedEvent { pid: 1500 })
+        );
+
+        // 4. 2-token legacy format: [pid, proc_name]
+        assert_eq!(
+            parse_proc_died("[12763, com.example.app]"),
+            Some(ProcDiedEvent { pid: 12763 })
+        );
+
+        // 5. Malformed inputs that previously triggered the oom_adj bug must be rejected (return None)
+        assert_eq!(
+            parse_proc_died("[0, not_a_pid, com.example.proc, 900, 16]"),
+            None
+        );
+        assert_eq!(
+            parse_proc_died("[0, not_a_pid, com.example.proc, 900, kill background]"),
+            None
+        );
+        assert_eq!(
+            parse_proc_died("[0, 900, kill background]"),
+            None
+        );
+        assert_eq!(
+            parse_proc_died("[0, 100, low memory]"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_resume_activity_comprehensive() {
+        // 1. Standard format: com.android.settings/.Settings
+        let res_std = parse_resume_activity("[0, 1234567, 12, com.android.settings/.Settings]").expect("std");
+        assert_eq!(res_std.pkg, "com.android.settings");
+        assert_eq!(res_std.component, "com.android.settings/.Settings");
+
+        // 2. Intent-wrapped: {com.google.android.calculator/com.android.calculator2.Calculator}
+        let res_wrapped = parse_resume_activity("[0, 1234567, 12, {com.google.android.calculator/com.android.calculator2.Calculator}]").expect("wrapped");
+        assert_eq!(res_wrapped.pkg, "com.google.android.calculator");
+        assert_eq!(res_wrapped.component, "com.google.android.calculator/com.android.calculator2.Calculator");
+
+        // 3. Complex Intent with flags: {act=android.intent.action.MAIN cmp=com.example.app/.MainActivity flg=0x10000000}
+        let res_complex = parse_resume_activity("[0, 1234567, 12, {act=android.intent.action.MAIN cmp=com.example.app/.MainActivity flg=0x10000000}]").expect("complex");
+        assert_eq!(res_complex.pkg, "com.example.app");
+        assert_eq!(res_complex.component, "com.example.app/.MainActivity");
+
+        // Via logcat dispatcher:
+        let line_complex = "I/wm_resume_activity: [0, 1234567, 12, {act=android.intent.action.MAIN cmp=com.example.app/.MainActivity flg=0x10000000}]";
+        match parse_logcat_line(line_complex) {
+            Some(LogcatEvent::ResumeActivity(ev)) => {
+                assert_eq!(ev.pkg, "com.example.app");
+                assert_eq!(ev.component, "com.example.app/.MainActivity");
             }
             other => panic!("Unexpected: {:?}", other),
         }

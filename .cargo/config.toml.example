@@ -1,0 +1,23 @@
+# .cargo/config.toml.example
+# Reference template for local toolchain overrides.
+#
+# If your NDK toolchain is not added to $PATH, you can either:
+# 1. Export the environment variable:
+#    export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="/path/to/ndk/.../bin/aarch64-linux-android29-clang"
+# 2. Or override linker paths here:
+
+[target.aarch64-linux-android]
+# Example Linux x86_64 NDK path:
+# linker = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+# Example macOS Apple Silicon NDK path:
+# linker = "/Users/username/Library/Android/sdk/ndk/27.1.12297006/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android29-clang"
+linker = "aarch64-linux-android29-clang"
+
+[target.armv7-linux-androideabi]
+linker = "armv7a-linux-androideabi29-clang"
+
+[target.i686-linux-android]
+linker = "i686-linux-android29-clang"
+
+[target.x86_64-linux-android]
+linker = "x86_64-linux-android29-clang"

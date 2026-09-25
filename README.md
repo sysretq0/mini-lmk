@@ -223,17 +223,65 @@ All operations are simultaneously written to `<base>/logs/operations.log` in NDJ
 
 ## Verified Device Performance
 
-Profiled on physical target hardware (MediaTek MT6789 / Helio G99, Android 14 API 34, aarch64):
+Profiled on physical target hardware (Android 14 API 34, Linux kernel 5.10, aarch64):
 
-| Metric | Measured Baseline | Target Budget |
-|---|---|---|
-| **Steady-State PSS** | **1,120 kB (~1.12 MB)** | < 2,500 kB |
-| **Private Dirty RAM** | **704 kB** | < 1,000 kB |
-| **Idle CPU Utilization** | **0.017% (task-clock 3.4 ms / 20s)** | < 0.10% |
-| **Event Loop Sleeping Ratio** | **99.97% (epoll_wait)** | > 98.0% |
-| **Reap Loop Reactor Impact** | **~5.2 ms** (via non-blocking spawn) | < 20 ms |
-| **99th Percentile UI Frame Time** | **22–36 ms** (13.8% drop in UI jank) | < 50 ms |
-| **Steady-State Steady Allocations** | **0 bytes** (zero heap churn) | 0 bytes |
+### Empirical Microbenchmark Suite: Kernel-Direct Procfs Latency Distribution
+
+Evaluated via the standalone, criterion-free `benches/microbench.rs` harness across 1,000 warm-up cycles and 10,000 timed iterations:
+
+| Target / Operation | Mechanism / Scope | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean | CFS Preemptions |
+|---|---|---|---|---|---|---|---|---|---|
+| `procfs::read_oom_score_adj` | self, hot cache | 10,000 | 2.85 µs | **3.31 µs** | 10.69 µs | 14.15 µs | 531.69 µs | 4.32 µs | 1 |
+| `procfs::read_oom_score_adj` | multi-PID pool (cold) | 10,000 | 4.69 µs | **8.69 µs** | 23.38 µs | 38.15 µs | 999.08 µs | 11.72 µs | 3 |
+| `procfs::read_statm_rss_kb` | self, hot cache | 10,000 | 3.69 µs | **4.23 µs** | 20.31 µs | 40.08 µs | 5.71 ms | 8.86 µs | 4 |
+| `procfs::read_statm_rss_kb` | multi-PID pool (cold) | 10,000 | 5.00 µs | **6.23 µs** | 10.46 µs | 14.77 µs | 450.38 µs | 7.07 µs | 0 |
+| `procfs::read_meminfo_kb` | `/proc/meminfo` | 10,000 | 7.69 µs | **8.00 µs** | 9.46 µs | 12.62 µs | 377.54 µs | 8.50 µs | 0 |
+| `telemetry::FormattedTime` | Stack buffer timestamp | 10,000 | 76.0 ns | **307.0 ns** | 308.0 ns | 308.0 ns | 2.54 µs | 261.3 ns | 0 |
+| `Instant::now` (Overhead) | Measurement baseline | 10,000 | 0.0 ns | **231.0 ns** | 385.0 ns | 539.0 ns | 2.38 µs | 226.7 ns | 0 |
+
+* **Cold Multi-PID Pool Access:** Reading across a dynamic pool of external system/user PIDs incurs ~8.7 µs P50 latency (vs 3.3 µs for self), comfortably qualifying multi-PID candidate batches in microseconds.
+* **Tail Latency Preemption Diagnostics:** Multi-millisecond Max outliers were verified via `CLOCK_THREAD_CPUTIME_ID` and `ru_nivcsw` counters to be caused by OS CFS scheduler thread preemption (actual thread execution time remained < 50 µs), not kernel VFS latency.
+
+### End-to-End Daemon Benchmarks: Idle vs Active App-Switching Pipeline
+
+Evaluated via `scripts/benchmark.sh` across both steady-state idle conditions ($N = 50$) and active live app-switching workloads ($N = 15$, cycling between Settings, Home, and Browser transitions):
+
+| Metric | Workload Mode | Iterations | Min | P50 (Median) | P95 | P99 | Max | Mean |
+|---|---|---|---|---|---|---|---|---|
+| **Cold-start Discovery** | Initial Boot Indexing | 50 | 181.1 ms | **251.6 ms** | 289.6 ms | 343.5 ms | 343.5 ms | 251.6 ms |
+| **Steady-State Memory (PSS)** | Idle Boot State | 50 | 1,081 kB | **1,109 kB** | 1,133 kB | 1,139 kB | 1,139 kB | 1,109 kB |
+| **Active Pipeline Memory (PSS)**| Live App-Switch Traffic | 15 | 1,150 kB | **1,165 kB** | 1,183 kB | 1,183 kB | 1,183 kB | 1,165 kB |
+| **Resident Set Size (RSS)** | Idle Boot State | 50 | 3,744 kB | **3,848 kB** | 3,944 kB | 4,012 kB | 4,012 kB | 3,850 kB |
+| **Resident Set Size (RSS)** | Live App-Switch Traffic | 15 | 3,852 kB | **3,960 kB** | 4,044 kB | 4,044 kB | 4,044 kB | 3,965 kB |
+| **Inter-Event Idle CPU Wakeups** | Post-Traffic Idle Window | 65 | 0 | **0** | 0 | 0 | 0 | 0.0 |
+
+* **Live Workload Memory Cost:** Populating `alive_apps`, `fg_lru`, `pkg_to_pids`, and `recent_deaths` tables during active app-switching only increases steady-state PSS by **+56 kB** (to 1,165 kB), remaining well below the 2.5 MB budget.
+* **Idle Wakeup Verification:** The single-threaded `epoll_wait` reactor produces strictly **0 CPU wakeups** during idle intervals between event bursts.
+
+### Low-UID System Package Safety (Empirical AMS Verification)
+
+Empirically verified on Android 14 that `cmd activity kill --user 0` terminates cached system packages (`uid < 10000`, e.g. `com.android.keychain` PID 29506 killed and terminated; `com.sprd.validationtools` PID 20352 killed and respawned). The daemon's fail-closed `uid >= 10000` guard prevents terminating critical platform services.
+
+### Reproducing Benchmarks
+
+The benchmark suite is completely automated and reproducible directly on Android hardware (API 29+, rootless `sh` compatible):
+
+```bash
+# 1. Cross-compile release daemon and standalone microbenchmark harness
+cargo build --release
+cargo build --release --bench microbench
+
+# 2. Push artifacts and runner script to Android device
+adb push target/aarch64-linux-android/release/mini-lmk /data/local/tmp/mini-lmk
+adb push $(ls -t target/aarch64-linux-android/release/deps/microbench-* | grep -v '\.d$' | head -n 1) /data/local/tmp/microbench
+adb push scripts/benchmark.sh /data/local/tmp/benchmark.sh
+
+# 3. Execute microbenchmark suite (multi-PID pool + dumpsys IPC comparison)
+adb shell "chmod 755 /data/local/tmp/mini-lmk /data/local/tmp/microbench /data/local/tmp/benchmark.sh && /data/local/tmp/microbench -n 10000 --dumpsys-iters 30"
+
+# 4. Execute end-to-end active app-switching workload benchmark
+adb shell "/data/local/tmp/benchmark.sh -n 15 -a"
+```
 
 ---
 
