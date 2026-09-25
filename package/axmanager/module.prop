@@ -1,7 +1,7 @@
 id=mini_lmk
 name=mini-lmk
-version=v1.2.0
-versionCode=120
+version=v1.3.0
+versionCode=130
 author=sysretq0
 description=Rootless event-driven userspace memory manager for Android 7.0+ (API 24+)
 axeronPlugin=1000
