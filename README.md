@@ -1,6 +1,6 @@
 # mini-lmk
 
-An event-driven userspace memory manager for Android 10+ (API 29–37+) running under Android shell privileges (UID 2000, non-root).
+An event-driven userspace memory manager for Android 7.0+ (API 24–37+) running under Android shell privileges (UID 2000, non-root).
 
 `mini-lmk` preempts kernel direct-reclaim thrashing and native `lmkd` stalls by proactively evicting stale background applications during foreground transition animations and background spawn events. Operating strictly via a single-threaded 2-file-descriptor `epoll` reactor, it maintains an operational footprint of **~1.12 MB PSS** with **0% idle CPU utilization**.
 
@@ -153,7 +153,7 @@ Applications that trigger immediate Game Mode memory reclamation (`T_idle -> 0s`
 
 ## Building
 
-Cross-compilation targets `aarch64-linux-android` using Android NDK (API 29+ compatibility):
+Cross-compilation targets `aarch64-linux-android` using Android NDK (API 24+ compatibility):
 
 ```bash
 # Add rust target

@@ -1,6 +1,6 @@
 # Architecture Specification & Technical Reference: mini-lmk
 
-mini-lmk is a rootless, single-threaded, event-driven memory management daemon operating under Android shell privileges (UID 2000, API 29–37+). It preempts kernel memory thrashing and native lmkd direct-reclaim stalls by tracking application idle durations via native system log events, evicting stale background applications cleanly through Android framework APIs.
+mini-lmk is a rootless, single-threaded, event-driven memory management daemon operating under Android shell privileges (UID 2000, API 24–37+). It preempts kernel memory thrashing and native lmkd direct-reclaim stalls by tracking application idle durations via native system log events, evicting stale background applications cleanly through Android framework APIs.
 
 ---
 
@@ -46,7 +46,7 @@ logcat -b events -v tag -s wm_resume_activity am_resume_activity am_proc_start a
 #### Event Handling & Canonicalization Rules
 
 * **`wm_resume_activity` & `am_resume_activity` (Foreground Focus Transitions):**
-  * *Payload:* `[<user_id>, <token>, <task_id>, <component_name>]` (Handles `am_resume_activity` on API 29 and `wm_resume_activity` on API 29–37+).
+  * *Payload:* `[<user_id>, <token>, <task_id>, <component_name>]` (Handles `am_resume_activity` on API 24–28 and `wm_resume_activity` on API 29–37+).
   * *Parsing:* Component is formatted as `<package>/<activity>`. Token matching dynamically locates the component containing `/` without relying on brittle positional indices. Substring extraction prior to `/` yields the foreground package name directly.
   * *Action:* Updates the foreground LRU history stack, stamps the outgoing package departure time, and triggers the reaping pipeline (with potential Game Mode escalation).
 

@@ -2,7 +2,7 @@
 # Linker resolution delegates to $PATH or CARGO_TARGET_<TARGET>_LINKER overrides.
 
 [target.aarch64-linux-android]
-linker = "aarch64-linux-android29-clang"
+linker = "aarch64-linux-android24-clang"
 rustflags = [
     "-C", "link-arg=-Wl,--gc-sections",
     "-C", "link-arg=-Wl,--exclude-libs,ALL",
@@ -11,7 +11,7 @@ rustflags = [
 ]
 
 [target.armv7-linux-androideabi]
-linker = "armv7a-linux-androideabi29-clang"
+linker = "armv7a-linux-androideabi24-clang"
 rustflags = [
     "-C", "link-arg=-Wl,--gc-sections",
     "-C", "link-arg=-Wl,--exclude-libs,ALL",
@@ -20,7 +20,7 @@ rustflags = [
 ]
 
 [target.i686-linux-android]
-linker = "i686-linux-android29-clang"
+linker = "i686-linux-android24-clang"
 rustflags = [
     "-C", "link-arg=-Wl,--gc-sections",
     "-C", "link-arg=-Wl,--exclude-libs,ALL",
@@ -29,7 +29,7 @@ rustflags = [
 ]
 
 [target.x86_64-linux-android]
-linker = "x86_64-linux-android29-clang"
+linker = "x86_64-linux-android24-clang"
 rustflags = [
     "-C", "link-arg=-Wl,--gc-sections",
     "-C", "link-arg=-Wl,--exclude-libs,ALL",

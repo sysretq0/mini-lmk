@@ -93,13 +93,64 @@ struct DaemonState {
     act_mode: bool,
 }
 
+/// Parse screen power state from `dumpsys power` output (API 24-27 fallback).
+/// Scans line-by-line to evaluate authoritative current state first and prevent
+/// false positives from historical logs or wake lock tables.
+pub fn parse_dumpsys_power_screen(stdout: &str) -> Option<bool> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("mHoldingDisplaySuspendBlocker=") {
+            if trimmed.contains("true") {
+                return Some(true);
+            } else if trimmed.contains("false") {
+                return Some(false);
+            }
+        }
+        if trimmed.starts_with("Display Power: state=") {
+            if trimmed.contains("ON") {
+                return Some(true);
+            } else if trimmed.contains("OFF") || trimmed.contains("DOZE") {
+                return Some(false);
+            }
+        }
+    }
+    None
+}
+
+/// Detect initial screen state at daemon startup.
+/// Fast path: `cmd deviceidle get screen` (API 28+).
+/// Fallback: `dumpsys power` (API 24-27). Defaults cleanly to `true` (screen on).
 #[inline(always)]
 fn detect_initial_screen_on() -> bool {
     Command::new("/system/bin/cmd")
         .args(["deviceidle", "get", "screen"])
         .output()
-        .map(|o| o.status.success() && o.stdout.starts_with(b"true"))
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            if o.stdout.starts_with(b"true") {
+                Some(true)
+            } else if o.stdout.starts_with(b"false") {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            let out = Command::new("/system/bin/dumpsys").arg("power").output().ok()?;
+            parse_dumpsys_power_screen(&String::from_utf8_lossy(&out.stdout))
+        })
         .unwrap_or(true)
+}
+
+/// Parse package name from `cmd package resolve-activity` output (API 24-28 fallback).
+pub fn parse_resolve_activity_pkg(stdout: &str) -> Option<&str> {
+    stdout.lines().find_map(|l| {
+        l.split_whitespace()
+            .find_map(|w| w.split_once('/'))
+            .map(|(pkg, _)| pkg.trim())
+            .filter(|pkg| !pkg.is_empty() && pkg.contains('.') && !pkg.starts_with(['-', '{']))
+    })
 }
 
 /// Non-allocating, sub-millisecond health probe for the spawned logcat stream.
@@ -392,6 +443,8 @@ impl DaemonState {
             ("SMS", "android.app.role.SMS"),
         ];
 
+        let mut home_detected = false;
+
         for (label, role) in roles {
             if let Ok(output) = Command::new("/system/bin/cmd").args(["role", "get-role-holders", role]).output() {
                 if output.status.success() {
@@ -408,9 +461,31 @@ impl DaemonState {
                             if !self.json_stdout {
                                 println!("[SYSTEM] Detected {}: {}", label, pkg);
                             }
+                            if role == "android.app.role.HOME" {
+                                home_detected = true;
+                            }
                             self.dynamic_exclusions.insert(pkg.to_string());
                         }
                     }
+                }
+            }
+        }
+
+        // Fallback for API 24-28 (Android 7.0-9.0): RoleManager does not exist.
+        // Fallback to querying default HOME launcher via cmd package resolve-activity.
+        if !home_detected {
+            let out = Command::new("/system/bin/cmd")
+                .args(["package", "resolve-activity", "--brief", "-c", "android.intent.category.HOME"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success());
+            if let Some(out) = out {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Some(pkg) = parse_resolve_activity_pkg(&stdout) {
+                    if !self.json_stdout {
+                        println!("[SYSTEM] Detected HOME (fallback): {}", pkg);
+                    }
+                    self.dynamic_exclusions.insert(pkg.to_string());
                 }
             }
         }
@@ -1128,7 +1203,7 @@ impl DaemonState {
 
 fn print_help() {
     println!(
-        r#"mini-lmk - Rootless event-driven memory manager for Android 10+ (API 29+)
+        r#"mini-lmk - Rootless event-driven memory manager for Android 7.0+ (API 24+)
 Usage: mini-lmk <MODE> [OPTIONS]
 
 Modes:
@@ -1342,6 +1417,49 @@ mod tests {
 
         // Verify Firefox is evicted from alive_apps
         assert!(!alive_apps.contains_key("org.mozilla.firefox"));
+    }
+
+    #[test]
+    fn test_parse_resolve_activity_pkg() {
+        // Multi-line output with match line
+        let output1 = "priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=true\ncom.google.android.apps.nexuslauncher/.NexusLauncherActivity";
+        assert_eq!(parse_resolve_activity_pkg(output1), Some("com.google.android.apps.nexuslauncher"));
+
+        // Single-line component
+        let output2 = "com.android.launcher3/.Launcher";
+        assert_eq!(parse_resolve_activity_pkg(output2), Some("com.android.launcher3"));
+
+        // Component with leading flags / match
+        let output3 = "match=0x200000 com.sec.android.app.launcher/com.sec.android.app.launcher.Launcher";
+        assert_eq!(parse_resolve_activity_pkg(output3), Some("com.sec.android.app.launcher"));
+
+        // No match / error
+        assert_eq!(parse_resolve_activity_pkg("No activity found"), None);
+        assert_eq!(parse_resolve_activity_pkg(""), None);
+        assert_eq!(parse_resolve_activity_pkg("Error: could not find activity"), None);
+    }
+
+    #[test]
+    fn test_parse_dumpsys_power_screen() {
+        // API 24-27 suspend blocker checks
+        assert_eq!(parse_dumpsys_power_screen("mHoldingDisplaySuspendBlocker=true\nmHoldingWakeLockSuspendBlocker=false"), Some(true));
+        assert_eq!(parse_dumpsys_power_screen("mHoldingDisplaySuspendBlocker=false\nmHoldingWakeLockSuspendBlocker=false"), Some(false));
+
+        // API 28+ display power state checks
+        assert_eq!(parse_dumpsys_power_screen("Display Power: state=ON"), Some(true));
+        assert_eq!(parse_dumpsys_power_screen("Display Power: state=OFF"), Some(false));
+        assert_eq!(parse_dumpsys_power_screen("Display Power: state=DOZE"), Some(false));
+
+        // Historical log edge cases: current state at top takes precedence over historical log entries
+        let history_off = "  mHoldingDisplaySuspendBlocker=false\nHistorical Suspend Blockers:\n  mHoldingDisplaySuspendBlocker=true";
+        assert_eq!(parse_dumpsys_power_screen(history_off), Some(false));
+
+        let history_on = "  mHoldingDisplaySuspendBlocker=true\nHistorical Suspend Blockers:\n  mHoldingDisplaySuspendBlocker=false";
+        assert_eq!(parse_dumpsys_power_screen(history_on), Some(true));
+
+        // Unrelated or malformed output
+        assert_eq!(parse_dumpsys_power_screen("PowerManagerService is dead"), None);
+        assert_eq!(parse_dumpsys_power_screen(""), None);
     }
 }
 

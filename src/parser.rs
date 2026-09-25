@@ -407,6 +407,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_am_resume_activity_api24() {
+        // 4-token standard Android 7.0-9.0: [user, token, task_id, component]
+        let line_4tok = "I/am_resume_activity: [0, 1234567, 12, com.android.dialer/.DialtactsActivity]";
+        match parse_logcat_line(line_4tok) {
+            Some(LogcatEvent::ResumeActivity(ev)) => {
+                assert_eq!(ev.pkg, "com.android.dialer");
+                assert_eq!(ev.component, "com.android.dialer/.DialtactsActivity");
+            }
+            other => panic!("Unexpected: {:?}", other),
+        }
+
+        // 3-token legacy payload: [user, task_id, component]
+        let line_3tok = "I/am_resume_activity: [0, 12, com.android.mms/.ui.ConversationList]";
+        match parse_logcat_line(line_3tok) {
+            Some(LogcatEvent::ResumeActivity(ev)) => {
+                assert_eq!(ev.pkg, "com.android.mms");
+                assert_eq!(ev.component, "com.android.mms/.ui.ConversationList");
+            }
+            other => panic!("Unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parse_proc_start() {
         let line = "I/am_proc_start: [0,12763,10130,com.google.android.calculator,next-top-activity,{com.google.android.calculator/com.android.calculator2.Calculator}]";
         match parse_logcat_line(line) {

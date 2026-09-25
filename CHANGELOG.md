@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.0] - 2026-09-25
+
+### Added
+- **Android 7.0+ (API 24+) Backward Compatibility:**
+  - Expanded compatibility envelope down to Android 7.0 (API 24+) while maintaining the zero-subprocess epoll reactor intact.
+  - **Launcher Discovery Fallback:** Added pre-API 29 fallback querying default `HOME` launcher via `cmd package resolve-activity --brief -c android.intent.category.HOME` when `RoleManager` is absent.
+  - **Initial Screen State Fallback:** Added pre-API 29 fallback evaluating `dumpsys power` (`mHoldingDisplaySuspendBlocker=true` or `Display Power: state=ON`) when `cmd deviceidle get screen` is unsupported, defaulting safely to `true`.
+  - **Legacy Event Logcat Support:** Event parser handles legacy Android 7.0/8.0 3-token `am_resume_activity` (`[user,component,reason]`) and 4-token `am_create_activity` (`[user,identity,component,reason]`) event formats.
+  - **NDK Toolchain Target:** Target linkers configured to `android24-clang` across all supported Android architectures (`aarch64`, `armv7`, `x86_64`, `i686`).
+
+### Changed
+- **Pipeline & Parser Streamlining:**
+  - Refactored `detect_initial_screen_on` into a functional fallback chain (`.ok().filter(...).and_then(...).or_else(...).unwrap_or(true)`).
+  - Modernized `parse_resolve_activity_pkg` using functional iterator pipelines with `find_map` and `split_once('/')`.
+  - Replaced libc `waitpid` and redundant `fcntl(F_GETFD)` calls in `probe_logcat_stream` with safe standard library `child.try_wait()` and descriptor polling.
+
+---
+
 ## [1.1.1] - 2026-09-25
 
 ### Fixed
