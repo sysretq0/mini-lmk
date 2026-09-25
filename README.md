@@ -1,6 +1,6 @@
 # mini-lmk
 
-An event-driven userspace memory manager for Android 7.0+ (API 24–37+) running under Android shell privileges (UID 2000, non-root).
+An event-driven userspace memory manager for Android 7.0+ (API 24+) running under Android shell privileges (UID 2000, non-root).
 
 `mini-lmk` preempts kernel direct-reclaim thrashing and native `lmkd` stalls by proactively evicting stale background applications during foreground transition animations and background spawn events. Operating strictly via a single-threaded 2-file-descriptor `epoll` reactor, it maintains an operational footprint of **~1.12 MB PSS** with **0% idle CPU utilization**.
 
@@ -9,10 +9,11 @@ An event-driven userspace memory manager for Android 7.0+ (API 24–37+) running
 ## Key Highlights
 
 * **Rootless / Shell-Privileged:** Operates under standard Android shell permissions (UID `2000`, `u:r:shell:s0` via ADB or Shizuku). Requires zero root, KernelSU, Magisk, or custom SELinux modifications while retaining access to the framework's `cmd activity` IPC interface and `logcat` event buffers.
-* **Zero-Allocation Hot Paths:** Parses binary logcat event streams and `/proc` metrics using stack-allocated buffers and zero-copy byte slicing. Zero heap allocations during steady-state reactor operations.
-* **Animation-Masked Eviction:** Reaping evaluations triggered by application switching (`wm_resume_activity` / `am_resume_activity`) mask framework kill latency behind native 200–300 ms window transition animations.
+* **Stack-Buffered Tokenizer & Procfs Readers:** Parses incoming logcat event lines and `/proc` metrics (`statm`, `meminfo`, `oom_score_adj`) using fixed stack-allocated buffers and string slicing, avoiding heap allocations in the log tokenizing and procfs query paths.
+* **Transition-Triggered Eviction:** Reaping evaluations are event-driven, triggered by foreground activity switches (`wm_resume_activity` / `am_resume_activity`) and background process creations (`am_proc_start`) rather than periodic polling timers.
 * **Background Spawn Triggering:** Intercepts background process creation (`am_proc_start`) while ignoring foreground task launches, resolving single-app inactivity deadlocks during extended stationary sessions without synthetic polling timers.
-* **Non-Blocking Asynchronous Reaping:** Dispatches `cmd activity kill --user all <pkg>` asynchronously via `posix_spawn` with non-blocking child harvesting (`libc::waitpid(-1, ..., WNOHANG)`), keeping UI render thread latency flat.
+* **Non-Blocking Asynchronous Reaping:** Dispatches eviction commands (`cmd activity kill --user all <pkg>`) asynchronously via the standard library (`std::process::Command::spawn()`) and reaps child processes non-blocking (`libc::waitpid(-1, ..., WNOHANG)`), preventing subprocess execution from blocking the epoll reactor.
+* **Fail-Closed System Safety:** Index-only cold boot discovery and strict `uid >= 10000` guards guarantee low-UID system daemons and platform services are never terminated.
 * **External Process Supervision:** Follows fail-fast systems design. If the upstream logcat pipe yields `EOF` or `EPOLLHUP`, the daemon exits immediately and cleanly, delegating process resurrection to an external supervisor loop (`run-daemon.sh`).
 * **Hardware-Scaled Burst Limits:** Sets eviction burst limits (`max_kills_per_pass`) to physical RAM detected at startup, protecting system_server Binder IPC queues from saturation.
 * **Bounded Disk Footprint:** Dual-output telemetry sink maintains an aligned human-readable terminal table alongside structured NDJSON operations logging with automatic 512 KB log rotation.
@@ -21,7 +22,7 @@ An event-driven userspace memory manager for Android 7.0+ (API 24–37+) running
 
 ## Architecture Overview
 
-```
+```text
 ┌────────────────────────────────────────────────────────┐
 │                      epoll_wait()                      │
 └───────────────────────────┬────────────────────────────┘
@@ -33,7 +34,7 @@ An event-driven userspace memory manager for Android 7.0+ (API 24–37+) running
     (logcat -b events -v tag)     (<base>/config/)
               │                           │
               ▼                           ▼
-    Zero-Copy Event Parser       Hot-Reload Configs
+      Text Event Parser          Hot-Reload Configs
               │
     ┌─────────┴────────────────────────────────┐
     │                                          │
@@ -41,20 +42,26 @@ Foreground Switch                      Background Spawn
 (wm_resume_activity)                   (am_proc_start)
     │                                          │
     ▼                                          ▼
-[Evaluate 3-Gate Pipeline]             [If !is_fg_launch: Evaluate]
+[Evaluate 4-Gate Pipeline]             [If !is_fg_launch: Evaluate]
     │
     ├─► Gate 1: Static & Dynamic Exclusions (IME, Launcher, Dialer, SMS, exclude.list)
     ├─► Gate 2: LRU Recency Protection Window (lru_protect_depth)
-    └─► Gate 3: Adaptive Idle Age (T_idle >= 180s, or 0s on Game Mode / Low RAM)
+    ├─► Gate 3: Adaptive Idle Age (T_idle >= 180s, 10s grace window on Game / Low RAM)
     │
     ▼
 Sort Candidates Descending by RSS (/proc/<pid>/statm)
     │
     ▼
-Dispatch: cmd activity kill --user all <pkg>
+[Gate 4: OOM Score Qualification] (min(oom_score_adj) < min_oom_score_adj?)
     │
-    ├── Immediately evicts package from alive_apps (prevents duplicate kills)
-    └── Retains pid_to_pkg mappings (enables attributing am_proc_died telemetry)
+    ├── YES: Candidate is ams_protected
+    │        ├── Skip cmd activity kill spawn (zero fork/exec IPC overhead)
+    │        ├── Refresh last_active in alive_apps (yields slot, retains audit heartbeat)
+    │        └── Emit KILL_SKIP / SIM_KILL telemetry
+    │
+    └── NO:  Dispatch: cmd activity kill --user all <pkg>
+             ├── Immediately evicts package from alive_apps (prevents duplicate kills)
+             └── Retains pid_to_pkg mappings (enables attributing am_proc_died telemetry)
 ```
 
 ---
@@ -65,22 +72,31 @@ Dispatch: cmd activity kill --user all <pkg>
 mini-lmk/
 ├── .cargo/
 │   └── config.toml          # Target configuration and linker rustflags
-├── Cargo.toml               # Package manifest and release profile optimizations
-├── LICENSE                  # GNU General Public License v3.0
-├── README.md                # Project documentation and quickstart
-├── package.sh               # Multi-ABI AxManager plugin packaging script
-├── run-daemon.sh            # Target hardware supervisor loop
+├── .github/
+│   └── workflows/
+│       └── build.yml        # Multi-ABI CI/CD build & packaging workflow
+├── benches/
+│   └── microbench.rs        # Standalone kernel-direct procfs microbenchmark suite
 ├── docs/
 │   └── ARCHITECTURE.md      # Architectural specification & reference
 ├── package/
 │   └── axmanager/           # AxManager / Axeron module configuration and scripts
-└── src/
-    ├── config.rs            # Runtime configuration parsing (daemon.conf)
-    ├── hasher.rs            # In-tree 64-bit FNV-1a hasher (zero-dependency)
-    ├── parser.rs            # Zero-allocation event log tokenizer and fallbacks
-    ├── procfs.rs            # Stack-buffered /proc readers (statm, meminfo, cmdline)
-    ├── telemetry.rs         # Dual-output TelemetrySink with 512 KB log rotation
-    └── main.rs              # Epoll reactor, state machine, and eviction pipeline
+├── scripts/
+│   └── benchmark.sh         # On-device end-to-end workload benchmarking runner
+├── src/
+│   ├── config.rs            # Runtime configuration parsing (daemon.conf)
+│   ├── hasher.rs            # In-tree 64-bit FNV-1a hasher (zero-dependency)
+│   ├── parser.rs            # Stack-buffered event log tokenizer and fallbacks
+│   ├── procfs.rs            # Stack-buffered /proc readers (statm, meminfo, cmdline)
+│   ├── telemetry.rs         # Dual-output TelemetrySink with 512 KB log rotation
+│   └── main.rs              # Epoll reactor, state machine, and eviction pipeline
+├── Cargo.lock               # Deterministic dependency manifest
+├── Cargo.toml               # Package manifest and release profile optimizations
+├── CHANGELOG.md             # Project release history & changelog
+├── LICENSE                  # GNU General Public License v3.0
+├── package.sh               # Multi-ABI AxManager plugin packaging script
+├── README.md                # Project documentation and quickstart
+└── run-daemon.sh            # Target hardware supervisor loop
 ```
 
 ---
@@ -100,7 +116,7 @@ t_idle_sec=180
 # Number of recently visited foreground packages immune from eviction
 lru_protect_depth=3
 
-# Low-memory watermark (percentage of MemTotal) triggering emergency T_idle=0s
+# Low-memory watermark (percentage of MemTotal) triggering emergency T_idle=10s grace window
 mem_critical_percent=10
 
 # Maximum depth of the foreground history ring buffer
@@ -123,7 +139,7 @@ min_oom_score_adj=900
 |---|---|---|---|
 | `t_idle_sec` | `180` | `u64` (seconds) | Background idle age before qualifying for eviction. |
 | `lru_protect_depth` | `3` | `usize` | Number of most recently used foreground apps shielded from eviction. |
-| `mem_critical_percent` | `10` | `u64` (%) | RAM watermark triggering emergency idle bypass (`T_idle = 0s`). |
+| `mem_critical_percent` | `10` | `u64` (%) | RAM watermark triggering emergency idle bypass (`T_idle = 10s` grace window). |
 | `fg_lru_max_depth` | `10` | `usize` | Maximum size of the foreground LRU ring buffer. |
 | `screen_off_harvest` | `true` | `bool` | Accelerates idle decay and narrows LRU depth to 1 during screen-off Doze cycles. |
 | `max_kills_per_pass` | `2` (auto-scaled) | `1`–`4` | Eviction burst cap. Scaled by RAM: `<=4.5GB` -> 4, `4.5-8.5GB` -> 2, `>8.5GB` -> 1. |
@@ -141,7 +157,7 @@ Package names shielded from termination under all conditions (one per line). **E
 
 ### `games.list`
 
-Applications that trigger immediate Game Mode memory reclamation (`T_idle -> 0s`) upon focus. **Empty by default out of the box**; populated by the user as needed:
+Applications that trigger immediate Game Mode memory reclamation (`T_idle -> 10s` grace window) upon focus. **Empty by default out of the box**; populated by the user as needed:
 
 ```text
 # Example game profiles (file is empty by default out of the box)
@@ -153,7 +169,7 @@ Applications that trigger immediate Game Mode memory reclamation (`T_idle -> 0s`
 
 ## Building
 
-Cross-compilation targets `aarch64-linux-android` using Android NDK (API 24+ compatibility):
+Cross-compilation targets `aarch64-linux-android` (alongside `armv7-linux-androideabi`, `x86_64-linux-android`, and `i686-linux-android`) using Android NDK (API 24+ compatibility):
 
 ```bash
 # Add rust target
@@ -194,12 +210,14 @@ adb shell "nohup /data/local/tmp/mlmk/run-daemon.sh --act > /data/local/tmp/mlmk
 
 ### Command-Line Arguments
 
+An operating mode (`--observe` or `--act`) must be explicitly specified:
+
 | Flag | Description |
 |---|---|
-| `--observe` | Run in observation mode (emits telemetry and simulates candidate kills). |
+| `--observe` | Run in observation mode (emits telemetry and simulates candidate kills; safe mode). |
 | `--act` | Run in active enforcement mode (`cmd activity kill --user all <pkg>`). |
 | `--json` | Output raw NDJSON directly to stdout instead of the formatted columnar table. |
-| `-h`, `--help` | Display usage and help message. |
+| `-h`, `--help` | Display usage and help manual. |
 
 ---
 
@@ -211,13 +229,14 @@ Live operations are formatted into aligned columns on standard output:
 # TIME         EVENT        TARGET                     DETAIL / REASON
 --------------------------------------------------------------------------------
 14:22:01.120   FG_SWITCH    com.shopee.id              prev=com.android.settings (14.2s)
-14:22:01.126   KILL         com.google.android.youtube rss=184MB  idle=410s  lru=4 [idle_expired]
+14:22:01.126   KILL         com.google.android.youtube rss=184MB  idle=410s  adj=950  lru=4 [idle_expired]
+14:22:01.127   KILL_SKIP    com.spotify.music          rss=312MB  idle=200s  adj=200  lru=5 [idle_expired] (ams_protected: spawn skipped)
 14:23:15.800   SCREEN_OFF   --                         active_session=74.6s
 14:25:40.200   SCREEN_ON    --                         sleep=144s
 14:25:40.201   BG_SUMMARY   --                         interval=144s  spawns=5  deaths=4  rss_delta=+12MB
 ```
 
-All operations are simultaneously written to `<base>/logs/operations.log` in NDJSON format, rotating to `operations.log.old` upon exceeding 512 KB.
+All operations are simultaneously written to `<base>/logs/operations.log` in structured NDJSON format (including `oom_score_adj`, `ams_protected`, and `spawn_skipped` fields), rotating to `operations.log.old` upon exceeding 512 KB.
 
 ---
 
@@ -264,7 +283,7 @@ Empirically verified on Android 14 that `cmd activity kill --user 0` terminates 
 
 ### Reproducing Benchmarks
 
-The benchmark suite is completely automated and reproducible directly on Android hardware (API 29+, rootless `sh` compatible):
+The benchmark suite is completely automated and reproducible directly on Android hardware (API 24+, rootless `sh` compatible):
 
 ```bash
 # 1. Cross-compile release daemon and standalone microbenchmark harness

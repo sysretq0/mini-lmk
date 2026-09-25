@@ -15,7 +15,7 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
-/// Zero-allocation, resilient event log parser supporting Android 10 (API 29) through Android 16 (API 37+).
+/// Zero-allocation, resilient event log parser supporting Android 7.0+ (API 24+).
 
 /// Slices directly from borrowed string buffers with zero heap allocation.
 
@@ -87,7 +87,7 @@ fn tokenize<'a, const N: usize>(inner: &'a str, out: &mut [&'a str; N]) -> usize
 
 /// Parse `wm_resume_activity` and `am_resume_activity` payloads.
 ///
-/// Standard format (API 29–37):
+/// Standard format (API 29+):
 /// `[<user_id>, <token>, <task_id>, <component_name>]`
 /// e.g. `[0,1234567,12,com.google.android.calculator/com.android.calculator2.Calculator]`
 ///
@@ -158,7 +158,7 @@ pub fn parse_resume_activity(payload: &str) -> Option<ResumeActivityEvent<'_>> {
 
 /// Parse `am_proc_start` payloads.
 ///
-/// Standard AOSP format (API 29–37):
+/// Standard AOSP format (API 29+):
 /// `[<user_id>, <pid>, <uid>, <process_name>, <type>, <component>]`
 /// e.g. `[0,12763,10130,com.google.android.calculator,next-top-activity,{...}]`
 ///
@@ -267,7 +267,7 @@ fn is_proc_name(s: &str) -> bool {
 
 /// Parse `am_proc_died` payloads.
 ///
-/// Standard AOSP format (API 29–37):
+/// Standard AOSP format (API 29+):
 /// `[<user_id>, <pid>, <process_name>, <oom_adj>, <reason>]`
 /// e.g. `[0,12763,com.google.android.calculator,900,kill background]`
 ///
