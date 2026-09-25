@@ -128,7 +128,6 @@ impl TelemetrySink {
     fn open_file(&mut self) {
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&self.log_path)
             .ok();
@@ -143,7 +142,7 @@ impl TelemetrySink {
     pub fn rotate(&mut self) {
         self.flush();
         self.writer = None;
-        let old_path = format!("{}.old", &self.log_path);
+        let old_path = format!("{}.old", self.log_path);
         let _ = fs::rename(&self.log_path, &old_path);
         #[cfg(unix)]
         {

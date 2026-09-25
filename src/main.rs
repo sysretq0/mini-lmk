@@ -255,8 +255,10 @@ impl DaemonState {
             );
         }
 
-        let mut config = RuntimeConfig::default();
-        config.max_kills_per_pass = detected_default_kills;
+        let config = RuntimeConfig {
+            max_kills_per_pass: detected_default_kills,
+            ..RuntimeConfig::default()
+        };
 
         let mut daemon = Self {
             config,
@@ -313,7 +315,7 @@ impl DaemonState {
             || {
                 let time_str = format_time_hms_ms(now_epoch);
                 let sign = if self.session_stats.spawn_rss_kb >= 0 { "+" } else { "-" };
-                let abs_rss_mb = (self.session_stats.spawn_rss_kb.abs() as u64 + 512) / 1024;
+                let abs_rss_mb = (self.session_stats.spawn_rss_kb.unsigned_abs() + 512) / 1024;
                 let detail = format!(
                     "interval={}s  spawns={}  deaths={}  rss_delta={}{}MB",
                     interval_sec, self.session_stats.bg_spawns, self.session_stats.bg_deaths, sign, abs_rss_mb
@@ -606,7 +608,7 @@ impl DaemonState {
             if prev_pkg != pkg {
                 // Guard: Only user/app packages with verified UID >= 10000 may enter alive_apps.
                 // Fail-closed: If UID cannot be resolved, assume protected/system and DO NOT insert.
-                if self.pkg_to_uid.get(prev_pkg).map_or(false, |&uid| uid >= 10000) {
+                if self.pkg_to_uid.get(prev_pkg).is_some_and(|&uid| uid >= 10000) {
                     if let Some(anchor) = self.alive_apps.get_mut(prev_pkg) {
                         prev_dur_ms = now_epoch.saturating_sub(*anchor);
                         *anchor = now_epoch;
@@ -953,7 +955,7 @@ impl DaemonState {
             }
         }
 
-        candidates.sort_by(|a, b| b.total_rss_kb.cmp(&a.total_rss_kb));
+        candidates.sort_by_key(|cand| std::cmp::Reverse(cand.total_rss_kb));
 
         for cand in candidates.into_iter().take(self.config.max_kills_per_pass) {
             let oom_adj = cand

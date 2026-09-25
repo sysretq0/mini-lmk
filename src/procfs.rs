@@ -83,7 +83,7 @@ pub fn read_oom_score_adj(pid: u32) -> Option<i32> {
 /// Reads MemTotal and MemAvailable from /proc/meminfo in kilobytes.
 pub fn read_meminfo_kb() -> (u64, u64) {
     let fd = unsafe {
-        libc::open(b"/proc/meminfo\0".as_ptr() as *const libc::c_char, libc::O_RDONLY | libc::O_CLOEXEC)
+        libc::open(c"/proc/meminfo".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
     };
     if fd < 0 {
         return (0, 0);
