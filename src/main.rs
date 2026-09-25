@@ -156,7 +156,7 @@ pub fn parse_resolve_activity_pkg(stdout: &str) -> Option<&str> {
 /// Non-allocating, sub-millisecond health probe for the spawned logcat stream.
 /// Validates child process survival and pipe integrity using non-blocking syscalls.
 pub fn probe_logcat_stream(child: &mut Child, pipe_fd: i32) -> Result<(), &'static str> {
-    // 1. Instant check: Has the child already exited (e.g. exec failure, missing binary, or SELinux denial)?
+    // 1. Immediate check (no sleeping, no retry): Has the child already exited (e.g. exec failure, missing binary, or SELinux denial)?
     match child.try_wait() {
         Ok(Some(_)) => {
             return Err("Child logcat process died immediately after spawn (SELinux denial, missing binary, or invalid arguments)");

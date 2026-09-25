@@ -185,7 +185,7 @@ cargo build --release --target aarch64-linux-android
 cargo test --target $(rustc -vV | sed -n 's/host: //p')
 ```
 
-The release profile compiles with `opt-level = "z"`, fat LTO, `panic = "abort"`, symbol stripping, and single codegen units. Measured stripped ELF sizes per ABI are listed in `docs/ARCHITECTURE.md` §1 (296–446 KB across the four targets).
+The release profile compiles with `opt-level = "z"`, fat LTO, `panic = "abort"`, symbol stripping, and single codegen units. Stripped ELF size bounds per ABI are in `docs/ARCHITECTURE.md` §1.
 
 ---
 

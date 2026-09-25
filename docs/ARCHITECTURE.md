@@ -11,7 +11,7 @@ mini-lmk is a rootless, single-threaded, event-driven memory management daemon o
 * **Identity:** Runs as non-root Android shell (`shell` / UID 2000, accessible via ADB or Shizuku).
 * **SELinux Domain:** `u:r:shell:s0` (Stock enforcing domain; zero root, KernelSU, Magisk, or custom sepolicy modifications required).
 * **Single-Threaded & Fail-Fast:** Operates strictly on a single thread. It maintains no in-process reconnection state machine: if the upstream logcat pipe closes, yields `EPOLLHUP`, or encounters unrecoverable read errors, the daemon exits immediately (`exit(1)`). Process supervision and restarts are delegated externally to an init service or shell supervisor loop (`run-daemon.sh`).
-* **Multi-ABI Target Footprint:** Native binary compiled across all primary Android architectures (`aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`, and `i686-linux-android`) against Bionic `libc` with `android24-clang` compatibility (stripped ELFs: 296 KB armv7, 405 KB aarch64, 428 KB i686, 446 KB x86_64; < 4 MB RSS operational footprint).
+* **Multi-ABI Target Footprint:** Native binary compiled across all primary Android architectures (`aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`, and `i686-linux-android`) against Bionic `libc` with `android24-clang` compatibility (Every target ships as a stripped ELF under 500 KB — armv7 is the smallest, comfortably under 350 KB, and 32-bit `x86` the largest; exact bytes move with the NDK and linker, so measure the published release asset rather than trusting a cached figure. Operational footprint stays inside the 4 MB RSS envelope.)
 
 ### 1.2 Minimal 2-FD Epoll Reactor & Sub-Millisecond Health Probe
 
