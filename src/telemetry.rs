@@ -390,9 +390,13 @@ mod tests {
         // Parent directory does not exist -> open_file() leaves `writer` as None.
         let dead_path = "/no-such-dir-mlmk/operations.log";
 
+        // All eight combinations: `emit_with` reads exactly these three inputs.
         // (json_stdout, stdout_tty, log_openable, columnar expected, json expected)
         let cases = [
             (true, true, true, false, true),     // --json on a terminal
+            (true, true, false, false, true),    // --json on a terminal, log unavailable
+            (true, false, true, false, true),    // --json into a pipe: the shipped service shape
+            (true, false, false, false, true),   // --json into a pipe, log unavailable
             (false, true, true, true, true),     // interactive: columnar row plus file record
             (false, true, false, true, false),   // human turned the log off: table only
             (false, false, true, false, true),   // service.sh: the file record is all that runs
@@ -400,6 +404,8 @@ mod tests {
         ];
         for (json, tty, log_ok, want_tabular, want_json) in cases {
             let path = if log_ok { path_str } else { dead_path };
+            // `log_openable` stands in for "the log is closed": an unopenable parent directory
+            // leaves `writer` as None, the same sink state `log_enabled = false` arrives at.
             let mut sink = TelemetrySink::with_stdout(path, json, true, tty);
             let (mut tabular, mut made_json) = (false, false);
             sink.emit_with(
@@ -423,7 +429,7 @@ mod tests {
         let content = fs::read_to_string(&tmp_path).unwrap();
         assert_eq!(
             content.matches(r#"{"event":"test"}"#).count(),
-            3,
+            4,
             "operations.log keeps receiving records in every mode that can open it"
         );
         assert!(!content.contains("rendered-row"), "the two formatters never mix outputs");
