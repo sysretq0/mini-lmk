@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.5.0] - 2026-09-26
+
+### Added
+- **Fast-Path Kill Dispatch (`src/spawn.rs`):** Replaced `std::process::Command` dispatch with a dedicated in-process `fork` launcher (`Backend::Fork`). The parent performs pre-clone validation and calls `libc::fork()`, returning immediately to the reactor while the child redirects stdio to a cached `/dev/null` descriptor via `dup2`, sweeps inherited descriptors, and execs `/system/bin/cmd activity kill --user all <pkg>`. Halves dispatch stall from 2.9–4.7 ms down to ~1.6 ms at shipping footprint. `MINI_LMK_SPAWN=std` is kept as a runtime override to allow A/B comparisons against the v1.4.0 launcher.
+- **Zero-Allocation Steady-State Kill Staging:** The kill argument vector is statically compiled; package names reuse a dedicated byte buffer (`name_buf`) that amortizes to zero allocations after seeing the longest package name.
+- **Pre-Exec Child Descriptor Sweep (`close_inherited`):** Because `fork()` copies the process descriptor table without constructing a new one, the child invokes `close_range(2)` (with a bounded `rlimit` fallback) before `execve` to ensure descriptors inherited from launchers (such as Magisk service pipes or ADB sockets) are never leaked to `cmd`.
+- **Auto-Created Documented Configuration (`daemon.conf`):** On startup, if `daemon.conf` is missing, the daemon automatically creates it with documented defaults (and touches `exclude.list` and `games.list` placeholders), logs `[CONFIG] Created default configuration at <path>`, and loads it directly from disk (write-then-load discipline). Gives instant discoverability for both root modules and standalone ADB runs without binary bloat.
+- **RAM-Scaled Eviction Bursts:** Hardware memory detection automatically tunes `max_kills_per_pass` (4 for <=4.5GB RAM, 2 for 4.5–8.5GB, 1 for >8.5GB) and announces it at startup, while allowing explicit override via `daemon.conf`.
+- **Dispatch Diagnostics & Telemetry Precision:** `KillRecord` replaces the legacy `spawned` boolean with an explicit `spawn_errno` (`None`/null in observe mode, `-2` if skipped by the AMS guard, `0` for successful launch, or a positive OS errno if synchronous refusal occurred). `spawn_skipped` is preserved as a derived property for backward compatibility with external consumers.
+- **Spawnprobe Tooling (`tools/spawnprobe`):** Vendored the standalone latency and descriptor probe into `tools/spawnprobe` with CI build support to keep roadmap latency tables empirical and falsifiable.
+- **POSIX Shell Validation Harness (`scripts/check-benchmark-sh.sh`):** Added automated validation ensuring `scripts/benchmark.sh` generates identical census reports under both `dash` and `bash`.
+
+### Changed
+- **Headless Service Hardening (`package/axmanager/service.sh`):** Simplified `service.sh` to a direct one-line launch (`nohup "$MODDIR/run-daemon.sh" >/dev/null 2>&1 &`). Eliminated the dead and hazardous `elif` fallback which failed to export `MODPATH`, bypassed boot completion synchronization, and ran without restart supervision.
+- **Enhanced Benchmark Metrics (`scripts/benchmark.sh`):** Added FD census and thread census metrics and verdicts to track descriptor leaks and threading invariants during sampling runs.
+- **Startup Announcement Integrity:** The live dispatch backend (`fork` or `std`) and any ignored `MINI_LMK_SPAWN` values are announced explicitly in startup banners.
+
+### Fixed
+- **32-Bit Target Compilation:** Resolved an unused variable warning (`_probe`) in `close_inherited` on 32-bit architectures (`armv7` and `i686`).
+
 ## [1.4.0] - 2026-09-25
 
 ### Added
