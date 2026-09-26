@@ -19,6 +19,7 @@ mod config;
 mod hasher;
 mod parser;
 mod procfs;
+mod spawn;
 mod telemetry;
 
 use config::{ConfigPaths, RuntimeConfig};
@@ -106,6 +107,73 @@ struct DaemonState {
     screen_on: bool,
     is_gaming: bool,
     act_mode: bool,
+    /// The kill dispatcher: which launcher was resolved at startup, its cached `/dev/null`
+    /// descriptor and its argument staging. See [`spawn`]; roadmap decisions D1-D5.
+    spawner: spawn::Spawner,
+}
+
+/// One kill decision, in the shape the log records it.
+///
+/// A struct rather than a 12-slot `format!` inside the dispatch loop because the interesting part
+/// of this record is *which of its four states* `spawn_errno` is in, and that deserves a test of
+/// its own instead of being asserted by reading a format string.
+struct KillRecord<'a> {
+    ts: u64,
+    event: &'static str,
+    pkg: &'a str,
+    pids: &'a [u32],
+    rss_freed_est_kb: u64,
+    reason: &'static str,
+    idle_sec: u64,
+    lru_pos: usize,
+    /// `None` = this build cannot dispatch (observe mode). `Some(NOT_DISPATCHED)` = the guard
+    /// declined. `Some(0)` = launched. `Some(n > 0)` = refused, synchronously.
+    spawn_errno: Option<libc::c_int>,
+    oom_score_adj: i32,
+    ams_protected: bool,
+}
+
+impl KillRecord<'_> {
+    /// The v1.4.0 field, which consumers still read. Derived from [`KillRecord::spawn_errno`]
+    /// rather than carried beside it, because the two are the same fact and a stored pair can
+    /// disagree while a derived one cannot:
+    ///
+    /// ```text
+    /// spawn_errno      spawn_skipped      meaning
+    /// None             true               observe mode: this build cannot dispatch
+    /// Some(-2)         true               a candidate was chosen, the AMS guard declined it
+    /// Some(0 | n > 0)  false              a dispatch was attempted
+    /// ```
+    ///
+    /// The `None` row is why the obvious rule `== Some(NOT_DISPATCHED)` is wrong: it reports `false`
+    /// in exactly the mode this daemon ships in by default.
+    fn spawn_skipped(&self) -> bool {
+        matches!(self.spawn_errno, None | Some(spawn::NOT_DISPATCHED))
+    }
+    fn to_json(&self) -> String {
+        // v1.4.0 wrote a `spawned` boolean here. It is gone rather than kept alongside, because the
+        // two would disagree in exactly the case that matters: a child that launched and then
+        // failed to `exec` reports success to us and exit 127 to nobody (roadmap 6.2).
+        let spawn_errno = match self.spawn_errno {
+            None => "null".to_string(),
+            Some(v) => v.to_string(),
+        };
+        format!(
+            r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawn_errno":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
+            self.ts,
+            self.event,
+            escape_json(self.pkg),
+            self.pids,
+            self.rss_freed_est_kb,
+            self.reason,
+            self.idle_sec,
+            self.lru_pos,
+            spawn_errno,
+            self.oom_score_adj,
+            self.ams_protected,
+            self.spawn_skipped(),
+        )
+    }
 }
 
 /// Parse screen power state from `dumpsys power` output (API 24-27 fallback).
@@ -226,8 +294,7 @@ impl DaemonState {
         }
 
         let paths = ConfigPaths::get();
-        let _ = fs::create_dir_all(&paths.config_dir);
-        let _ = fs::create_dir_all(&paths.logs_dir);
+        paths.ensure_default_files(json_stdout);
 
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epoll_fd < 0 {
@@ -317,6 +384,12 @@ impl DaemonState {
             no_log_cli,
             config_announced: false,
             startup_record: None,
+            // D3: the backend is an override surface, so a device we cannot reflash can still be
+            // measured against v1.4.0's own dispatcher. Unset and unrecognised both mean `fork`,
+            // never `spawn`.
+            spawner: spawn::Spawner::new(spawn::Backend::parse(
+                std::env::var("MINI_LMK_SPAWN").ok().as_deref(),
+            )),
             session_start: now,
             // Seed the classifier with the bootstrap read instead of a sentinel, so the
             // unsynchronized-RTC -> NTP step is detected on the *first* event. The only
@@ -966,15 +1039,24 @@ impl DaemonState {
     }
 
     /// Kill-decision telemetry naming, shared by the dispatch path and its test.
-    /// Returns `(json_event, columnar_tag, detail_suffix, spawn_skipped)`.
-    fn kill_telemetry_parts(act_mode: bool, ams_protected: bool) -> (&'static str, &'static str, &'static str, bool) {
+    /// Returns `(json_event, columnar_tag, detail_suffix)`.
+    ///
+    /// The v1.4.0 `spawn_skipped` boolean used to be a fourth element here. It is now derived from
+    /// `spawn_errno` by [`KillRecord::spawn_skipped`], which is the same fact stated once: this
+    /// function's `!act_mode || ams_protected` and that match's `None | Some(NOT_DISPATCHED)` cover
+    /// exactly the same four cases, and a copy that can drift out of its twin is not worth the
+    /// second field in the record.
+    fn kill_telemetry_parts(
+        act_mode: bool,
+        ams_protected: bool,
+    ) -> (&'static str, &'static str, &'static str) {
         let (event_name, tag, sim_suffix) = match (act_mode, ams_protected) {
             (true, false) => ("kill", "KILL", ""),
             (true, true) => ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)"),
             (false, false) => ("simulated_kill", "SIM_KILL", " (simulated)"),
             (false, true) => ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)"),
         };
-        (event_name, tag, sim_suffix, !act_mode || ams_protected)
+        (event_name, tag, sim_suffix)
     }
 
     fn evaluate_reaping_pipeline(&mut self, now_epoch: u64) {
@@ -1095,23 +1177,33 @@ impl DaemonState {
 
             let rss_mb = cand.total_rss_kb / 1024;
 
-            let is_spawned = self.act_mode.then(|| {
-                !ams_protected
-                    && Command::new("/system/bin/cmd")
-                        .args(["activity", "kill", "--user", "all", &cand.pkg])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                        .is_ok()
-            });
+            // D6: an errno where v1.4.0 had a boolean. Only *pre-clone* failures can land here:
+            // `fork` reports success for a binary that then fails to `exec`, so a missing
+            // `/system/bin/cmd` is a child exit 127 that never reaches this field (roadmap 6.2).
+            // Reading a `0` here as "the kill happened" is the lie D6 removes.
+            let spawn_errno = if !self.act_mode {
+                None
+            } else if ams_protected {
+                Some(spawn::NOT_DISPATCHED)
+            } else {
+                Some(self.spawner.spawn_kill(&cand.pkg))
+            };
 
-            let (event_name, tag, sim_suffix, spawn_skipped) =
+            let (event_name, tag, sim_suffix) =
                 Self::kill_telemetry_parts(self.act_mode, ams_protected);
 
-            let spawned_val = match is_spawned {
-                Some(v) => if v { "true" } else { "false" },
-                None => "null",
+            let record = KillRecord {
+                ts: now_epoch,
+                event: event_name,
+                pkg: &cand.pkg,
+                pids: &cand.live_pids,
+                rss_freed_est_kb: cand.total_rss_kb,
+                reason,
+                idle_sec: cand.idle_sec,
+                lru_pos: cand.lru_pos,
+                spawn_errno,
+                oom_score_adj: oom_adj,
+                ams_protected,
             };
             self.telemetry.emit_with(
                 || {
@@ -1122,10 +1214,7 @@ impl DaemonState {
                     );
                     format!("{:<12}   {:<12} {:<26} {}", time_str, tag, cand.pkg, detail)
                 },
-                || format!(
-                    r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawned":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
-                    now_epoch, event_name, escape_json(&cand.pkg), cand.live_pids, cand.total_rss_kb, reason, cand.idle_sec, cand.lru_pos, spawned_val, oom_adj, ams_protected, spawn_skipped
-                ),
+                || record.to_json(),
             );
             self.telemetry.flush();
 
@@ -1165,6 +1254,28 @@ impl DaemonState {
                 if self.act_mode { "ACT" } else { "OBSERVE" }
             );
             let _ = writeln!(stdout(), "[DAEMON] Monitoring FDs: [TOKEN_LOGCAT_PIPE, TOKEN_INOTIFY]");
+            // D4: name the live dispatcher. An ignored `MINI_LMK_SPAWN` is reported as loudly as a
+            // degraded one, because otherwise the same word - "fork" - means "as shipped", "because
+            // your request made no sense" and "because /dev/null was unavailable", and only one of
+            // those three is what the operator meant.
+            let backend = self.spawner.backend().name();
+            let ignored =
+                spawn::unrecognised_backend(std::env::var("MINI_LMK_SPAWN").ok().as_deref());
+            if let Some(text) = &ignored {
+                let _ = writeln!(
+                    stdout(),
+                    "[DAEMON] ignoring MINI_LMK_SPAWN={:?}: not a backend (std, fork)",
+                    text
+                );
+            }
+            let detail = match self.spawner.note() {
+                Some(note) => format!(" ({note})"),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                stdout(),
+                "[DAEMON] Kill dispatch backend: {backend}{detail}"
+            );
         }
 
         if self.telemetry.tabular_stdout() {
@@ -1492,18 +1603,120 @@ mod tests {
 
     #[test]
     fn test_kill_telemetry_parts() {
-        assert_eq!(DaemonState::kill_telemetry_parts(true, false), ("kill", "KILL", "", false));
+        assert_eq!(
+            DaemonState::kill_telemetry_parts(true, false),
+            ("kill", "KILL", "")
+        );
         assert_eq!(
             DaemonState::kill_telemetry_parts(true, true),
-            ("kill_skipped", "KILL_SKIP", " (ams_protected: spawn skipped)", true)
+            (
+                "kill_skipped",
+                "KILL_SKIP",
+                " (ams_protected: spawn skipped)"
+            )
         );
         assert_eq!(
             DaemonState::kill_telemetry_parts(false, false),
-            ("simulated_kill", "SIM_KILL", " (simulated)", true)
+            ("simulated_kill", "SIM_KILL", " (simulated)")
         );
         assert_eq!(
             DaemonState::kill_telemetry_parts(false, true),
-            ("simulated_kill", "SIM_KILL", " (simulated, ams_protected: spawn skipped)", true)
+            (
+                "simulated_kill",
+                "SIM_KILL",
+                " (simulated, ams_protected: spawn skipped)"
+            )
+        );
+    }
+
+    /// Build the record exactly the way the dispatch loop does, from the same two inputs.
+    fn record_from_pipeline(
+        act_mode: bool,
+        ams_protected: bool,
+        dispatched: libc::c_int,
+    ) -> KillRecord<'static> {
+        const NO_RECORD: KillRecord<'static> = KillRecord {
+            ts: 0,
+            event: "kill",
+            pkg: "",
+            pids: &[],
+            rss_freed_est_kb: 0,
+            reason: "idle_expired",
+            idle_sec: 0,
+            lru_pos: 0,
+            spawn_errno: None,
+            oom_score_adj: 0,
+            ams_protected: false,
+        };
+        let mut record = NO_RECORD;
+        record.event = DaemonState::kill_telemetry_parts(act_mode, ams_protected).0;
+        record.spawn_errno = if !act_mode {
+            None
+        } else if ams_protected {
+            Some(spawn::NOT_DISPATCHED)
+        } else {
+            Some(dispatched)
+        };
+        record.ams_protected = ams_protected;
+        record
+    }
+
+    #[test]
+    fn kill_record_json_reports_which_of_its_four_states_spawn_errno_is() {
+        // This is why `KillRecord` is a struct and not a 12-slot `format!` in the middle of the
+        // dispatch loop: the load-bearing information is *which state* the field is in, and a
+        // format string cannot be tested without reading it as prose.
+        let dispatched = record_from_pipeline(true, false, 0);
+        let skipped = record_from_pipeline(true, true, 0);
+        let observe = record_from_pipeline(false, false, 0);
+        let refused = record_from_pipeline(true, false, libc::EBADF);
+
+        assert!(dispatched.to_json().contains(r#""spawn_errno":0"#));
+        assert!(skipped
+            .to_json()
+            .contains(&format!(r#""spawn_errno":{}"#, spawn::NOT_DISPATCHED)));
+        assert!(observe.to_json().contains(r#""spawn_errno":null"#));
+        assert!(
+            refused.to_json().contains(r#""spawn_errno":9"#),
+            "EBADF must be passed through as the number a consumer greps for, got {}",
+            refused.to_json()
+        );
+
+        // The two states that mean "nothing was launched", and the two that mean it was.
+        assert!(
+            observe.spawn_skipped(),
+            "observe mode attempted no dispatch"
+        );
+        assert!(skipped.spawn_skipped(), "the guard declined this one");
+        assert!(!dispatched.spawn_skipped(), "launched");
+        assert!(
+            !refused.spawn_skipped(),
+            "the spawner refused, but it did try"
+        );
+
+        // `spawn_skipped` is derived, so it must agree with the pipeline that used to carry it as
+        // a second copy of the same fact - including in observe mode, where the naive rule
+        // `spawn_errno == Some(NOT_DISPATCHED)` reports `false`.
+        for (act, ams) in [(true, false), (true, true), (false, false), (false, true)] {
+            let record = record_from_pipeline(act, ams, 0);
+            assert_eq!(
+                record.spawn_skipped(),
+                !act || ams,
+                "spawn_skipped disagrees with the pipeline for act={act} ams={ams}"
+            );
+        }
+
+        // The record the v1.4.0 consumer reads: `spawn_skipped` is still there, and no `spawned`
+        // boolean came back alongside it to disagree.
+        let json = skipped.to_json();
+        assert!(json.contains(r#""spawn_skipped":true"#), "{json}");
+        assert!(
+            !json.contains("spawned"),
+            "the v1.4.0 boolean must not return: {json}"
+        );
+        assert!(
+            json.starts_with(r#"{"ts":0,"event":"kill_skipped","pkg":"","pids":[],"rss_freed_est_kb":0,"reason":"idle_expired","idle_sec":0,"lru_pos":0,"spawn_errno":-2,"oom_score_adj":0,"ams_protected":true,"spawn_skipped":true}"#),
+            "field order is the log format: {json}"
         );
     }
 
@@ -1723,6 +1936,9 @@ mod tests {
             no_log_cli: false,
             config_announced: false,
             startup_record: None,
+            // The test harness keeps the shipped dispatcher. It is the backend the daemon runs by
+            // default, so a test that dispatches at all exercises the same code a device does.
+            spawner: spawn::Spawner::new(spawn::Backend::Fork),
             alive_apps: FastMap::default(),
             pid_to_pkg: FastMap::default(),
             pkg_to_pids: FastMap::default(),

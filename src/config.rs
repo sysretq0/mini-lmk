@@ -15,8 +15,8 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::io::Write;
 use std::io::stdout;
+use std::io::Write;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +63,28 @@ impl ConfigPaths {
             operations_log,
         }
     }
+
+    /// Ensure the base directory structure, list files, and default daemon.conf exist on disk.
+    /// Returns true if the default configuration template was written.
+    pub fn ensure_default_files(&self, quiet: bool) -> bool {
+        let _ = std::fs::create_dir_all(&self.config_dir);
+        let _ = std::fs::create_dir_all(&self.logs_dir);
+        let p_ex = std::path::Path::new(&self.exclude_file);
+        if !p_ex.exists() {
+            let _ = std::fs::write(
+                &self.exclude_file,
+                "# Package names excluded from eviction (one per line)\n",
+            );
+        }
+        let p_gm = std::path::Path::new(&self.games_file);
+        if !p_gm.exists() {
+            let _ = std::fs::write(
+                &self.games_file,
+                "# Game package names monitored for game session mode (one per line)\n",
+            );
+        }
+        RuntimeConfig::ensure_default_file(&self.config_file, quiet)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +114,66 @@ impl Default for RuntimeConfig {
     }
 }
 
+pub const DEFAULT_DAEMON_CONF: &str = r#"# mini-lmk runtime configuration (daemon.conf)
+# Live-tunable parameters, reloaded automatically via inotify.
+
+# Base background idle timeout before eviction eligibility (seconds)
+t_idle_sec = 180
+
+# Number of recently visited foreground packages immune from eviction
+lru_protect_depth = 3
+
+# Low-memory watermark (percentage of MemTotal) triggering emergency T_idle=10s grace window
+mem_critical_percent = 10
+
+# Maximum depth of the foreground history ring buffer
+fg_lru_max_depth = 10
+
+# Deep screen-off harvesting (drops LRU depth to 1 and accelerates idle decay)
+screen_off_harvest = true
+
+# Eviction burst cap: maximum background apps evicted per reap pass.
+# Uncomment to override auto-scaling (<=4.5GB RAM -> 4, 4.5-8.5GB -> 2, >8.5GB -> 1).
+# max_kills_per_pass = 2
+
+# Minimum oom_score_adj threshold required for eviction (range: 500-900, default: 900)
+# 900: Conservative (cached & idle processes only; protects all background services)
+# 500: Aggressive (matches AOSP SERVICE_ADJ; reclaims background services for games/heavy loads)
+min_oom_score_adj = 900
+
+# Append NDJSON records to logs/operations.log. Telemetry only: kill decisions,
+# the terminal table, and the --json stream are unaffected.
+log_enabled = true
+"#;
+
 impl RuntimeConfig {
+    /// Ensure the configuration file exists on disk. If missing, creates the parent directory,
+    /// writes the documented default configuration template, and prints a notification
+    /// to stdout unless quiet is requested.
+    ///
+    /// Returns true if the template was written, or false if the file was already present.
+    pub fn ensure_default_file(path: &str, quiet: bool) -> bool {
+        let p = std::path::Path::new(path);
+        if p.exists() {
+            return false;
+        }
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(path, DEFAULT_DAEMON_CONF).is_ok() {
+            if !quiet {
+                let _ = writeln!(
+                    stdout(),
+                    "[CONFIG] Created default configuration at {}",
+                    path
+                );
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn parse_str(&mut self, text: &str) {
         for line in text.lines() {
             let line = line.trim();
@@ -174,14 +255,34 @@ mod tests {
         assert_eq!(p_default.base_dir, "/data/local/tmp/mlmk");
         assert_eq!(p_default.config_dir, "/data/local/tmp/mlmk/config");
         assert_eq!(p_default.logs_dir, "/data/local/tmp/mlmk/logs");
-        assert_eq!(p_default.config_file, "/data/local/tmp/mlmk/config/daemon.conf");
-        assert_eq!(p_default.exclude_file, "/data/local/tmp/mlmk/config/exclude.list");
-        assert_eq!(p_default.games_file, "/data/local/tmp/mlmk/config/games.list");
-        assert_eq!(p_default.operations_log, "/data/local/tmp/mlmk/logs/operations.log");
+        assert_eq!(
+            p_default.config_file,
+            "/data/local/tmp/mlmk/config/daemon.conf"
+        );
+        assert_eq!(
+            p_default.exclude_file,
+            "/data/local/tmp/mlmk/config/exclude.list"
+        );
+        assert_eq!(
+            p_default.games_file,
+            "/data/local/tmp/mlmk/config/games.list"
+        );
+        assert_eq!(
+            p_default.operations_log,
+            "/data/local/tmp/mlmk/logs/operations.log"
+        );
 
-        let p_mod = ConfigPaths::from_base("/data/user_de/0/com.android.shell/axeron/plugins/mini_lmk/mlmk/");
-        assert_eq!(p_mod.base_dir, "/data/user_de/0/com.android.shell/axeron/plugins/mini_lmk/mlmk");
-        assert_eq!(p_mod.config_file, "/data/user_de/0/com.android.shell/axeron/plugins/mini_lmk/mlmk/config/daemon.conf");
+        let p_mod = ConfigPaths::from_base(
+            "/data/user_de/0/com.android.shell/axeron/plugins/mini_lmk/mlmk/",
+        );
+        assert_eq!(
+            p_mod.base_dir,
+            "/data/user_de/0/com.android.shell/axeron/plugins/mini_lmk/mlmk"
+        );
+        assert_eq!(
+            p_mod.config_file,
+            "/data/user_de/0/com.android.shell/axeron/plugins/mini_lmk/mlmk/config/daemon.conf"
+        );
     }
 
     #[test]
@@ -243,5 +344,39 @@ mod tests {
         cfg.parse_str("t_idle_sec = 60 # aggressive\nlru_protect_depth=2# tight");
         assert_eq!(cfg.t_idle_sec, 60);
         assert_eq!(cfg.lru_protect_depth, 2);
+    }
+
+    #[test]
+    fn test_ensure_default_file_and_paths() {
+        let base_dir = std::env::temp_dir().join(format!("mlmk_cfg_test_{}", std::process::id()));
+        let base_str = base_dir.to_string_lossy().to_string();
+        let paths = ConfigPaths::from_base(&base_str);
+
+        assert!(!std::path::Path::new(&paths.config_file).exists());
+        assert!(!std::path::Path::new(&paths.exclude_file).exists());
+        assert!(!std::path::Path::new(&paths.games_file).exists());
+
+        // First call creates directories, list placeholders, and daemon.conf
+        assert!(paths.ensure_default_files(true));
+        assert!(std::path::Path::new(&paths.config_file).exists());
+        assert!(std::path::Path::new(&paths.exclude_file).exists());
+        assert!(std::path::Path::new(&paths.games_file).exists());
+
+        // Second call sees existing file and returns false without overwriting
+        assert!(!paths.ensure_default_files(true));
+
+        // Verify the template parses to defaults
+        let mut cfg = RuntimeConfig::default();
+        cfg.load_from_file(&paths.config_file, true);
+        assert_eq!(cfg.t_idle_sec, 180);
+        assert_eq!(cfg.lru_protect_depth, 3);
+        assert_eq!(cfg.mem_critical_percent, 10);
+        assert_eq!(cfg.fg_lru_max_depth, 10);
+        assert!(cfg.screen_off_harvest);
+        assert_eq!(cfg.max_kills_per_pass, 2);
+        assert_eq!(cfg.min_oom_score_adj, 900);
+        assert!(cfg.log_enabled);
+
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 }

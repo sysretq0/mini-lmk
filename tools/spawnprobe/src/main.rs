@@ -109,14 +109,44 @@ unsafe fn sym(name: &[u8]) -> Option<*mut libc::c_void> {
     if p.is_null() { None } else { Some(p) }
 }
 
+/// Storage for one of the two opaque `posix_spawn*` objects.
+///
+/// `libc` aliases `posix_spawn_file_actions_t` and `posix_spawnattr_t` to `*mut c_void`,
+/// which is true of Bionic (whose objects really are pointer-sized handles) and is *not*
+/// the size of the C object. glibc defines them as plain structs -- measured here, on an
+/// aarch64 glibc 2.43 host, at 80 B and **336 B** -- and `*_init` writes the whole thing.
+/// An 8-byte slot is therefore a stack smash the moment this binary runs on a host, which
+/// is where docs/ROADMAP.md 6.4's sizing argument was measured; CI only *builds* this
+/// crate (`--target aarch64-linux-android`), it never runs it. The
+/// object size differs by libc *and* by ABI, so nothing can be asserted at compile time:
+/// 512 B is deliberately over-allocated, and a `usize` array carries the alignment.
+type Obj = [usize; OBJ_WORDS];
+const OBJ_WORDS: usize = 64;
+
+fn zero_obj() -> Obj {
+    [0usize; OBJ_WORDS]
+}
+
+/// The C prototypes take a *pointer* to the object, so these handles are pointer-to-buffer,
+/// cast into whatever shape each `type` alias above happens to spell.
+trait ObjHandle {
+    fn handle(&mut self) -> *mut *mut libc::c_void;
+    fn chandle(&self) -> *const *mut libc::c_void;
+    fn as_void(&self) -> *const libc::c_void;
+}
+
+impl ObjHandle for Obj {
+    fn handle(&mut self) -> *mut *mut libc::c_void { self.as_mut_ptr().cast() }
+    fn chandle(&self) -> *const *mut libc::c_void { self.as_ptr().cast() }
+    fn as_void(&self) -> *const libc::c_void { self.as_ptr().cast() }
+}
+
 /// The three file_actions entry points, all __INTRODUCED_IN(28) in Bionic's spawn.h.
-/// posix_spawn_file_actions_t is a pointer to an opaque struct, so the object the
-/// caller owns is exactly one pointer wide.
 struct FileActions {
     init: ActionsInit,
     adddup2: ActionsAdddup2,
     destroy: ActionsDestroy,
-    obj: *mut libc::c_void,
+    obj: Obj,
 }
 
 impl FileActions {
@@ -129,7 +159,7 @@ impl FileActions {
                 init: core::mem::transmute(init),
                 adddup2: core::mem::transmute(adddup2),
                 destroy: core::mem::transmute(destroy),
-                obj: core::ptr::null_mut(),
+                obj: zero_obj(),
             })
         }
     }
@@ -257,8 +287,18 @@ fn usage(prog: &str) -> ! {
     std::process::exit(2)
 }
 
-const TRUE_PATH: &[u8] = b"/system/bin/true\0";
+/// The `true` target stands for "a tiny binary that exits at once", which every Unix has;
+/// only its path differs. Resolving it off-device is what lets `vf`, `ladder` and
+/// `execfail` run against glibc in CI -- and that is how 6.4's buffer sizing, and the fact
+/// that glibc *accepts and ignores* `adddup2` file actions, were both found.
+const TRUE_PATH: &[u8] = if cfg!(target_os = "android") {
+    b"/system/bin/true\0"
+} else {
+    b"/bin/true\0"
+};
 const CMD_PATH: &[u8] = b"/system/bin/cmd\0";
+const TRUE_LABEL: &str = if cfg!(target_os = "android") { "/system/bin/true" } else { "/bin/true" };
+const CMD_LABEL: &str = "/system/bin/cmd";
 
 /// The child to dispatch: path plus the argv that follows it.
 struct Target {
@@ -483,7 +523,7 @@ unsafe fn vfork_suite(iters: usize, tgt: &Target) {
     let argv = tgt.argv();
     let envp = environ;
     let pathp = tgt.path.as_ptr() as *const libc::c_char;
-    let bin = if std::ptr::eq(tgt.path, CMD_PATH) { "/system/bin/cmd" } else { "/system/bin/true" };
+    let bin = if std::ptr::eq(tgt.path, CMD_PATH) { CMD_LABEL } else { TRUE_LABEL };
     let devnull =
         unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR | libc::O_CLOEXEC) };
     let (ahp, sw) = unsafe { thp_swap() };
@@ -504,15 +544,15 @@ unsafe fn vfork_suite(iters: usize, tgt: &Target) {
     // Does Bionic even accept POSIX_SPAWN_USEVFORK? glibc made it a no-op in 2.24;
     // the disassembly says Bionic still tests bit 6. getflags() settles the store.
     if let Some(mut at) = SpawnAttr::resolve() {
-        let r_init = unsafe { (at.init)(&mut at.obj) };
-        let r_set = unsafe { (at.setflags)(&mut at.obj, POSIX_SPAWN_USEVFORK) };
+        let r_init = unsafe { (at.init)(at.obj.handle()) };
+        let r_set = unsafe { (at.setflags)(at.obj.handle(), POSIX_SPAWN_USEVFORK) };
         let mut got: libc::c_short = -1;
-        let r_get = unsafe { (at.getflags)(&at.obj, &mut got) };
+        let r_get = unsafe { (at.getflags)(at.obj.chandle(), &mut got) };
         println!(
             "R usevfork_attr init={r_init} setflags={r_set} getflags={r_get} readback=0x{got:x} want=0x{:x} -- bit 6 is stored; the flat USEVFORK row below is the behavioural proof that Bionic honours it",
             POSIX_SPAWN_USEVFORK
         );
-        let _ = unsafe { (at.destroy)(&mut at.obj) };
+        let _ = unsafe { (at.destroy)(at.obj.handle()) };
     } else {
         println!("R posix_spawnattr_* unresolved -> USEVFORK branch not testable");
     }
@@ -604,14 +644,14 @@ unsafe fn vfork_suite(iters: usize, tgt: &Target) {
             for _ in 0..iters {
                 let t = Instant::now();
                 let mut pid: libc::pid_t = 0;
-                unsafe { (fa.init)(&mut fa.obj) };
+                unsafe { (fa.init)(fa.obj.handle()) };
                 for fd in 0..3 {
-                    unsafe { (fa.adddup2)(&mut fa.obj, devnull, fd) };
+                    unsafe { (fa.adddup2)(fa.obj.handle(), devnull, fd) };
                 }
                 let rc = unsafe {
-                    spawn(&mut pid, pathp, &fa.obj as *const _ as *const libc::c_void, core::ptr::null(), argv.as_ptr(), envp)
+                    spawn(&mut pid, pathp, fa.obj.as_void(), core::ptr::null(), argv.as_ptr(), envp)
                 };
-                let _ = unsafe { (fa.destroy)(&mut fa.obj) };
+                let _ = unsafe { (fa.destroy)(fa.obj.handle()) };
                 if rc != 0 {
                     println!("R posix_spawn actions rc={rc}");
                     break;
@@ -626,17 +666,17 @@ unsafe fn vfork_suite(iters: usize, tgt: &Target) {
                 for _ in 0..iters {
                     let t = Instant::now();
                     let mut pid: libc::pid_t = 0;
-                    unsafe { (fa.init)(&mut fa.obj) };
+                    unsafe { (fa.init)(fa.obj.handle()) };
                     for fd in 0..3 {
-                        unsafe { (fa.adddup2)(&mut fa.obj, devnull, fd) };
+                        unsafe { (fa.adddup2)(fa.obj.handle(), devnull, fd) };
                     }
-                    unsafe { (at.init)(&mut at.obj) };
-                    let rset = unsafe { (at.setflags)(&mut at.obj, POSIX_SPAWN_USEVFORK) };
+                    unsafe { (at.init)(at.obj.handle()) };
+                    let rset = unsafe { (at.setflags)(at.obj.handle(), POSIX_SPAWN_USEVFORK) };
                     let rc = unsafe {
-                        spawn(&mut pid, pathp, &fa.obj as *const _ as *const libc::c_void, &at.obj as *const _ as *const libc::c_void, argv.as_ptr(), envp)
+                        spawn(&mut pid, pathp, fa.obj.as_void(), at.obj.as_void(), argv.as_ptr(), envp)
                     };
-                    let _ = unsafe { (fa.destroy)(&mut fa.obj) };
-                    let _ = unsafe { (at.destroy)(&mut at.obj) };
+                    let _ = unsafe { (fa.destroy)(fa.obj.handle()) };
+                    let _ = unsafe { (at.destroy)(at.obj.handle()) };
                     if rc != 0 {
                         println!("R posix_spawn USEVFORK rc={rc} setflags={rset}");
                         break;
@@ -668,7 +708,7 @@ unsafe fn env_suite(iters: usize, tgt: &Target) {
     let devnull =
         unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR | libc::O_CLOEXEC) };
     let mk = || {
-        let mut c = Command::new(if std::ptr::eq(tgt.path, CMD_PATH) { "/system/bin/cmd" } else { "/system/bin/true" });
+        let mut c = Command::new(if std::ptr::eq(tgt.path, CMD_PATH) { CMD_LABEL } else { TRUE_LABEL });
         c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         for a in tgt.extra {
             c.arg(a);
@@ -686,7 +726,7 @@ unsafe fn env_suite(iters: usize, tgt: &Target) {
         }
         n
     };
-    let bin = if std::ptr::eq(tgt.path, CMD_PATH) { "/system/bin/cmd" } else { "/system/bin/true" };
+    let bin = if std::ptr::eq(tgt.path, CMD_PATH) { CMD_LABEL } else { TRUE_LABEL };
     println!("R suite=env target={bin} iters={iters} pid={}", unsafe { libc::getpid() });
     let mut pad = String::with_capacity(301);
     for _ in 0..300 {
@@ -776,18 +816,18 @@ unsafe fn fdcheck_mode() {
             else { "/data/local/tmp/fdcheck_vf.txt".to_string() };
         let tmp = std::fs::OpenOptions::new().read(true).write(true).create(true)
             .truncate(true).open(outpath.as_str()).expect("tmp");
-        let r0 = (fa.init)(&mut fa.obj);
+        let r0 = (fa.init)(fa.obj.handle());
         let (addopen, r1, r2, r3) = if *use_open {
             let ao = sym(b"posix_spawn_file_actions_addopen\0").unwrap();
             let ao = core::mem::transmute::<_, unsafe extern "C" fn(*mut *mut libc::c_void, libc::c_int, *const libc::c_char, libc::c_int, libc::mode_t) -> libc::c_int>(ao);
             let np = std::ffi::CString::new("/dev/null").unwrap();
             let tp = std::ffi::CString::new(outpath.as_str()).unwrap();
-            (true, ao(&mut fa.obj, 0, np.as_ptr(), libc::O_RDWR, 0), ao(&mut fa.obj, 1, tp.as_ptr(), libc::O_RDWR|libc::O_CREAT|libc::O_TRUNC, 0o644), ao(&mut fa.obj, 2, tp.as_ptr(), libc::O_RDWR|libc::O_APPEND, 0o644))
+            (true, ao(fa.obj.handle(), 0, np.as_ptr(), libc::O_RDWR, 0), ao(fa.obj.handle(), 1, tp.as_ptr(), libc::O_RDWR|libc::O_CREAT|libc::O_TRUNC, 0o644), ao(fa.obj.handle(), 2, tp.as_ptr(), libc::O_RDWR|libc::O_APPEND, 0o644))
         } else {
-            (false, (fa.adddup2)(&mut fa.obj, devnull.as_raw_fd(), 0), (fa.adddup2)(&mut fa.obj, tmp.as_raw_fd(), 1), (fa.adddup2)(&mut fa.obj, tmp.as_raw_fd(), 2))
+            (false, (fa.adddup2)(fa.obj.handle(), devnull.as_raw_fd(), 0), (fa.adddup2)(fa.obj.handle(), tmp.as_raw_fd(), 1), (fa.adddup2)(fa.obj.handle(), tmp.as_raw_fd(), 2))
         };
-        let ra = (at.init)(&mut at.obj);
-        let rs = if *usevfork { (at.setflags)(&mut at.obj, POSIX_SPAWN_USEVFORK) } else { 0 };
+        let ra = (at.init)(at.obj.handle());
+        let rs = if *usevfork { (at.setflags)(at.obj.handle(), POSIX_SPAWN_USEVFORK) } else { 0 };
         let sh = std::ffi::CString::new("/system/bin/toybox").unwrap();
         let a1 = std::ffi::CString::new("ls").unwrap();
         let a2 = std::ffi::CString::new("-l").unwrap();
@@ -796,8 +836,8 @@ unsafe fn fdcheck_mode() {
             vec![sh.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr(), std::ptr::null()];
         let envp: *const *const libc::c_char = environ;
         let mut pid: libc::pid_t = 0;
-        let rc = spawn_fn(&mut pid, sh.as_ptr(), &fa.obj as *const _ as *const libc::c_void,
-            if *usevfork { &at.obj as *const _ as *const libc::c_void } else { std::ptr::null() },
+        let rc = spawn_fn(&mut pid, sh.as_ptr(), fa.obj.as_void(),
+            if *usevfork { at.obj.as_void() } else { std::ptr::null() },
             argv.as_ptr(), envp);
         println!("FDCHECK file={outpath} usevfork={usevfork} addopen={addopen} init={r0} actions=({r1},{r2},{r3}) attr_init={ra} setflags={rs} spawn_rc={rc} pid={pid}");
         let mut status: libc::c_int = -1;
@@ -826,16 +866,16 @@ unsafe fn execfail_mode() {
     };
     let devnull = std::fs::File::open("/dev/null").unwrap();
     for usevfork in &[false, true] {
-        let _ = (fa.init)(&mut fa.obj);
-        for fd in 0..3 { let _ = (fa.adddup2)(&mut fa.obj, devnull.as_raw_fd(), fd); }
-        let _ = (at.init)(&mut at.obj);
-        if *usevfork { let _ = (at.setflags)(&mut at.obj, POSIX_SPAWN_USEVFORK); }
+        let _ = (fa.init)(fa.obj.handle());
+        for fd in 0..3 { let _ = (fa.adddup2)(fa.obj.handle(), devnull.as_raw_fd(), fd); }
+        let _ = (at.init)(at.obj.handle());
+        if *usevfork { let _ = (at.setflags)(at.obj.handle(), POSIX_SPAWN_USEVFORK); }
         let bad = std::ffi::CString::new("/system/bin/no-such-binary").unwrap();
         let argv: Vec<*const libc::c_char> = vec![bad.as_ptr(), std::ptr::null()];
         let mut pid: libc::pid_t = -1;
         let t = std::time::Instant::now();
-        let rc = spawn_fn(&mut pid, bad.as_ptr(), &fa.obj as *const _ as *const libc::c_void,
-            if *usevfork { &at.obj as *const _ as *const libc::c_void } else { std::ptr::null() },
+        let rc = spawn_fn(&mut pid, bad.as_ptr(), fa.obj.as_void(),
+            if *usevfork { at.obj.as_void() } else { std::ptr::null() },
             argv.as_ptr(), environ);
         let dur = t.elapsed().as_micros();
         if rc != 0 {
@@ -846,7 +886,7 @@ unsafe fn execfail_mode() {
         let mut status: libc::c_int = -1;
         let w = libc::waitpid(pid, &mut status, 0);
         println!("EXECFAIL usevfork={usevfork} rc=0 pid={pid} waitpid={w} status={status:#x} parent_waited={dur} us (child reported the error)");
-        let _ = (fa.destroy)(&mut fa.obj);
+        let _ = (fa.destroy)(fa.obj.handle());
     }
 }
 /// adddup2 vs addopen, measured instead of asserted. Two questions:
@@ -870,11 +910,11 @@ unsafe fn openfd_mode(iters: usize, tgt: &Target) {
     let bad_argv: Vec<*const libc::c_char> = vec![bad.as_ptr(), std::ptr::null()];
 
     for (label, use_open, failing) in [("adddup2 (cached fd)", false, false), ("addopen (path)", true, false), ("adddup2, exec FAILS", false, true), ("addopen, exec FAILS", true, true)] {
-        let mut obj: *mut libc::c_void = std::ptr::null_mut();
-        let _ = init(&mut obj);
+        let mut obj = zero_obj();
+        let _ = init(obj.handle());
         let mut r = Vec::new();
         for fd in 0..3 {
-            let rc = if use_open { addopen(&mut obj, fd, nullpath.as_ptr(), libc::O_RDWR, 0) } else { adddup2(&mut obj, devnull.as_raw_fd(), fd) };
+            let rc = if use_open { addopen(obj.handle(), fd, nullpath.as_ptr(), libc::O_RDWR, 0) } else { adddup2(obj.handle(), devnull.as_raw_fd(), fd) };
             r.push(rc);
         }
         let fds_before = fd_count();
@@ -884,12 +924,12 @@ unsafe fn openfd_mode(iters: usize, tgt: &Target) {
         for _ in 0..iters {
             let mut pid: libc::pid_t = 0;
             let t = std::time::Instant::now();
-            let rc = spawn_fn(&mut pid, apath, &obj as *const _ as *const libc::c_void, std::ptr::null(), aargv, environ);
+            let rc = spawn_fn(&mut pid, apath, obj.as_void(), std::ptr::null(), aargv, environ);
             samples.push(t.elapsed().as_micros() as f64);
             if rc == 0 { pids.push(pid); } else { println!("OPENFD {label}: spawn rc={rc}"); }
         }
         for pid in &pids { reap(*pid as u32); }
-        let _ = destroy(&mut obj);
+        let _ = destroy(obj.handle());
         std::thread::sleep(std::time::Duration::from_millis(200));
         let fds_after = fd_count();
         stats(label, samples, &format!("action_rcs={:?} fds_before={fds_before} fds_after={fds_after} leaked={}", r, fds_after.saturating_sub(fds_before)));
@@ -919,25 +959,25 @@ unsafe fn vfopen_mode(iters: usize, tgt: &Target) {
     for round in 0..3 {
         for use_open in [false, true] {
             let label = if use_open { "USEVFORK + addopen" } else { "USEVFORK + adddup2" };
-            let _ = (at.init)(&mut at.obj);
-            let _ = (at.setflags)(&mut at.obj, POSIX_SPAWN_USEVFORK);
-            let mut obj: *mut libc::c_void = std::ptr::null_mut();
-            let _ = (b.init)(&mut obj);
+            let _ = (at.init)(at.obj.handle());
+            let _ = (at.setflags)(at.obj.handle(), POSIX_SPAWN_USEVFORK);
+            let mut obj = zero_obj();
+            let _ = (b.init)(obj.handle());
             for fd in 0..3 {
-                if use_open { let _ = ao(&mut obj, fd, np.as_ptr(), libc::O_RDWR, 0); }
-                else { let _ = (b.adddup2)(&mut obj, devnull.as_raw_fd(), fd); }
+                if use_open { let _ = ao(obj.handle(), fd, np.as_ptr(), libc::O_RDWR, 0); }
+                else { let _ = (b.adddup2)(obj.handle(), devnull.as_raw_fd(), fd); }
             }
             let mut bench = Bench::new(iters);
             for _ in 0..iters {
                 let t0 = std::time::Instant::now();
                 let mut pid: libc::pid_t = 0;
-                let rc = spawn_fn(&mut pid, pathp, &obj as *const _ as *const libc::c_void,
-                    &at.obj as *const _ as *const libc::c_void, argv.as_ptr(), environ);
+                let rc = spawn_fn(&mut pid, pathp, obj.as_void(),
+                    at.obj.as_void(), argv.as_ptr(), environ);
                 if rc != 0 { println!("VFOPEN {label} rc={rc}"); break; }
                 bench.push(t0, pid, true);
             }
-            let _ = (b.destroy)(&mut obj);
-            let _ = (at.destroy)(&mut at.obj);
+            let _ = (b.destroy)(obj.handle());
+            let _ = (at.destroy)(at.obj.handle());
             bench.rows(label, &format!("round={round}"));
             use std::io::Write as _; let _ = std::io::stdout().flush();
         }
@@ -958,6 +998,15 @@ fn main() {
     if tname != "true" && tname != "cmd" {
         eprintln!("F unknown target {tname:?} -- want true or cmd");
         usage(&prog);
+    }
+    // `cmd` is the Android command tool and the only target whose numbers are quoted as
+    // the daemon's. There is no host stand-in for it, and timing a path that cannot exec
+    // would print a row of failure latencies that reads like a backend table.
+    if tname == "cmd" && !cfg!(target_os = "android") {
+        eprintln!("F target \"cmd\" is Android-only; /system/bin/cmd does not exist here.");
+        eprintln!("F Use \"true\" for a host (glibc) FFI check, or run the aarch64 build on");
+        eprintln!("F a device -- see docs/ROADMAP.md Appendix A.");
+        std::process::exit(2);
     }
     let tgt = target_from(tname);
     let mode = args.get(3).map(String::as_str).unwrap_or("ladder");
@@ -1046,7 +1095,7 @@ fn main() {
 unsafe fn backend_ladder(iters: usize, tgt: &Target) {
     let argv = tgt.argv();
     let pathp = tgt.path.as_ptr() as *const libc::c_char;
-    let bin = if std::ptr::eq(tgt.path, CMD_PATH) { "/system/bin/cmd" } else { "/system/bin/true" };
+    let bin = if std::ptr::eq(tgt.path, CMD_PATH) { CMD_LABEL } else { TRUE_LABEL };
     let mk = || {
         let mut c = Command::new(bin);
         c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -1135,16 +1184,16 @@ unsafe fn backend_ladder(iters: usize, tgt: &Target) {
         for _ in 0..iters {
             let t = Instant::now();
             let mut pid: libc::pid_t = 0;
-            let r_init = unsafe { (fa.init)(&mut fa.obj) };
+            let r_init = unsafe { (fa.init)(fa.obj.handle()) };
             if r_init != 0 { panic!("file_actions_init rc={r_init}"); }
             for fd in 0..3 {
-                let r = unsafe { (fa.adddup2)(&mut fa.obj, devnull, fd) };
+                let r = unsafe { (fa.adddup2)(fa.obj.handle(), devnull, fd) };
                 if r != 0 { panic!("adddup2 {fd} rc={r}"); }
             }
             let rc = unsafe {
-                spawn(&mut pid, pathp, &fa.obj as *const _ as *const libc::c_void, core::ptr::null(), argv.as_ptr(), environ)
+                spawn(&mut pid, pathp, fa.obj.as_void(), core::ptr::null(), argv.as_ptr(), environ)
             };
-            let _ = unsafe { (fa.destroy)(&mut fa.obj) };
+            let _ = unsafe { (fa.destroy)(fa.obj.handle()) };
             let dt = t.elapsed().as_secs_f64() * 1e6;
             if rc != 0 { rc_seen += 1; }
             s4.push(dt);
@@ -1165,10 +1214,10 @@ unsafe fn backend_ladder(iters: usize, tgt: &Target) {
             for _ in 0..iters {
                 let t = Instant::now();
                 let mut pid: libc::pid_t = 0;
-                unsafe { (fa.init)(&mut fa.obj) };
-                for fd in 0..n_actions as i32 { unsafe { (fa.adddup2)(&mut fa.obj, devnull, fd) }; }
-                let rc = unsafe { spawn(&mut pid, pathp, &fa.obj as *const _ as *const libc::c_void, core::ptr::null(), argv.as_ptr(), environ) };
-                let _ = unsafe { (fa.destroy)(&mut fa.obj) };
+                unsafe { (fa.init)(fa.obj.handle()) };
+                for fd in 0..n_actions as i32 { unsafe { (fa.adddup2)(fa.obj.handle(), devnull, fd) }; }
+                let rc = unsafe { spawn(&mut pid, pathp, fa.obj.as_void(), core::ptr::null(), argv.as_ptr(), environ) };
+                let _ = unsafe { (fa.destroy)(fa.obj.handle()) };
                 let dt = t.elapsed().as_secs_f64() * 1e6;
                 if rc != 0 { fails += 1; } else { v.push(dt); }
                 reap_wait(pid);
@@ -1432,7 +1481,7 @@ struct SpawnAttr {
     setflags: AttrSetFlags,
     getflags: AttrGetFlags,
     destroy: AttrDestroy,
-    obj: *mut libc::c_void,
+    obj: Obj,
 }
 
 impl SpawnAttr {
@@ -1447,7 +1496,7 @@ impl SpawnAttr {
                 setflags: core::mem::transmute(setflags),
                 getflags: core::mem::transmute(getflags),
                 destroy: core::mem::transmute(destroy),
-                obj: core::ptr::null_mut(),
+                obj: zero_obj(),
             })
         }
     }

@@ -19,23 +19,31 @@ daemon's single reactor thread (the `for cand in candidates.into_iter().take(
 self.config.max_kills_per_pass)` loop). That call does not return until the kernel has
 finished with the child's address space. While it is inside, the reactor cannot read the
 logcat pipe, cannot service inotify, and cannot make decisions. The fix shortens that
-window and, more importantly, stops it depending on things we do not control.
+window. What it does *not* do is make the window independent of our own resident set - `fork`'s
+cost is a function of the parent's RSS (§2, §3.2) - and this release accepts that trade on
+purpose, because the daemon's footprint is bounded and §8 turns the bound into a measured
+criterion instead of an assumption.
 
 Two things this is **not**, because both were asserted in earlier pitches and neither
 survives measurement:
 
 * **It is not an fd leak.** `std::process::Command::spawn` on Android opens nothing: the
-  probe records `fds_during_spawn=4` across 60 dispatches — the daemon's own four
-  descriptors, unchanged. The "secret socketpair doubles the FD count" story does not
-  reproduce here; a syscall-filtered `strace` of the same path found `clone`, `execve`,
-  `wait4` and 379 `rt_sigprocmask`, and **zero** `socket`, `socketpair` or `pipe2`.
+  probe records `fds_during_spawn=4` across 60 dispatches — the census count of that
+  capture, unchanged across all of them. Read the 4 as "this capture's census", never as a
+  property of a daemon: the count is a function of the build and the mode, and v1.5.0 adds
+  one descriptor (the cached `/dev/null`) that v1.4.0 did not have. The finding is the
+  *flatness*, which is the only part that survives a rebuild. The "secret socketpair doubles
+  the FD count" story does not reproduce here; a syscall-filtered `strace` of the same path
+  found `clone`, `execve`, `wait4` and 379 `rt_sigprocmask`, and **zero** `socket`,
+  `socketpair` or `pipe2`.
 * **It is not an animation-budget problem.** This daemon is not the UI thread. A dispatch
   stall delays *our next decision*, not a frame. Anyone quoting 16.6 ms frame budgets for
   this call site has the wrong thread.
 
 The honest framing: **reactor tail latency, plus aligning runtime behaviour with the
 documented single-threaded, zero-allocation, no-internal-state invariants**
-(`docs/ARCHITECTURE.md` §2). We are paying 4.7 ms to learn nothing.
+(`docs/ARCHITECTURE.md` §2). We are paying 2.9–4.7 ms — §9's whole spread for one backend, and
+the honest way to quote `std` — to learn nothing.
 
 ## 2. The mechanism: two independent costs, and only one of them is ours
 
@@ -62,8 +70,11 @@ sweep in §3.2 prices: the `fork` route costs 1,613 µs at our 2.8 MB shipping f
 (1,885 µs measured in §3.2, less the 272 µs the same `clone` costs with no suspension in
 §3.1 — a cross-run subtraction, so read it as "about a third of a millisecond's worth of
 page tables we do not copy", not as a measured quantity) and **34,044 µs more** at
-1,283 MB than at 3 MB, which is in-run and is the number that decides D1. The `CLONE_VM`
-family pays neither: it is 1,375–1,537 µs at every footprint in that range.
+1,283 MB than at 3 MB. The `CLONE_VM` family pays neither: it is 1,375–1,537 µs at every
+footprint in that range. Both halves of that sentence are true and §4 still does not buy the
+`CLONE_VM` route, because the two curves only separate at footprints this daemon is
+constructed not to reach (§3.2, §5.9, and the budget in §8), while at the footprint it does
+occupy they are inside each other's noise (§9).
 
 ## 3. Measurements
 
@@ -78,10 +89,10 @@ confuses the two.
 | backend | `[parent]` P50 | note |
 |---|---|---|
 | `std::process::Command` (today) | **4,681 µs** | strace-proven `clone()`, no `CLONE_VM`, no `socketpair` |
-| `libc::fork` + 3 `dup2` + `execve` | 1,627 µs | this roadmap's original choice — see §5.4 |
+| **`libc::fork` + 3 `dup2` + `execve`** | 1,627 µs | **the shipped backend** (§4 D1) |
 | `posix_spawn`, NULL actions | 1,324 µs | fastest, **unshippable** — §5.3 |
 | `posix_spawn` + 3 `dup2` actions | 1,844 µs | Bionic silently downgrades to `fork()` |
-| **`posix_spawn` + 3 `dup2` + `POSIX_SPAWN_USEVFORK`** | **1,387 µs** | the choice: actions *and* vfork |
+| **`posix_spawn` + 3 `dup2` + `POSIX_SPAWN_USEVFORK`** | **1,387 µs** | measured, not shipped (§4 D2, §5.4) |
 | raw `clone(CLONE_VM\|CLONE_VFORK)`, hand-written asm child | 1,272 µs | 8.3 % better, rejected — §5.5 |
 | raw `clone(CLONE_VM)`, no suspension | 272 µs | **control only, unsafe** — prices (b) |
 
@@ -93,7 +104,7 @@ Against today: `fork()` is 2.88x cheaper, `USEVFORK` is **3.37x** cheaper. Again
 Two things to notice. The three `dup2` actions cost **+457 µs** when Bionic is allowed to
 downgrade to `fork()` (1,844 without the flag, 1,387 with it) — the flag is not a
 micro-optimisation, it is what keeps the call off the page-table path. And the raw clone
-route is 8.3 % faster than D1 (1,272 vs 1,387 µs), which §5.5 declines to buy with
+route is 8.3 % faster than the best measured alternative (1,272 vs 1,387 µs), which §5.5 declines to buy with
 per-ABI assembly.
 
 The unsafe control row is what makes (a) and (b) separable: deleting the suspension
@@ -102,7 +113,7 @@ suspended wait for the linker and ~0.27 ms is the shared-address-space `clone`. 
 no version of "launch a real dynamically linked binary" much below ~1.2 ms on this device
 — which is also why a pitch promising 60–110 µs is not credible.
 
-### 3.2 The footprint sweep — the decisive table
+### 3.2 The footprint sweep — the table that decided D1, and why D1 changed
 
 One process, resident footprint raised by touching anonymous memory (one byte per page),
 all backends re-timed at each step, real `cmd` target, n=30/step. `AnonHugePages` and
@@ -128,10 +139,16 @@ Two conclusions, and the second one reversed this roadmap's earlier plan:
    a non-NULL `file_actions` silently buys you a `fork()`. The tie measured in an earlier
    round was real; it was just a tie *at every footprint*, which is the part we had wrong.
 
-At the daemon's live 2,832 kB RSS the gap between `fork` and `USEVFORK` is modest. The
-asymmetry is what we are buying: `fork`'s number is a function of a variable we do not
-control (our own footprint, and the device's willingness to hand us pages), while
-`USEVFORK`'s is a function of the size of `/system/bin/cmd`.
+At the daemon's live 2,832 kB RSS the gap between `fork` and `USEVFORK` is 240 µs of a
+1,500 µs stall, and §9 measured that gap's *sign* flipping between two consecutive captures.
+The asymmetry in the table is real, so the honest question is not "does `fork` scale" but
+"can this process ever be big enough for the scaling to matter" — and the answer is no: the
+daemon's resident set is bounded by three fixed-cardinality tables plus a rotating log
+(§5.9), it has measured 3,876–4,020 kB under live app-switch traffic, and §3.2's first column
+is 2.8 MB while its second is 259 MB. Paying for the flat curve means paying a second
+dispatch path, a `dlsym` and a deprecated flag to insure against a footprint the design
+forbids, which is why D1 is `fork` and this table is now evidence *about the mechanism*, not
+a purchase order.
 
 ### 3.3 Environment size, measured in one process (n=150 per point)
 
@@ -207,52 +224,71 @@ its `execve` (§2(b)).
 
 ## 4. Decisions
 
-**D1 — Primary backend: `posix_spawn` with three `adddup2` file actions plus a
-`posix_spawnattr` carrying `POSIX_SPAWN_USEVFORK` (0x40), all resolved by `dlsym` at
-startup.**
-*Why:* it is the only measured option that is simultaneously fast (1,387 µs), flat in our
-own footprint (0.9x across 430x of RSS), stdio-correct (§3.4), and — decisively — **not our
-assembly**. The `vfork` discipline stays Bionic's problem, in Bionic's code, which acquires
-the allocator's locks before the clone and runs its child under the `returns_twice` contract
-we cannot express in stable Rust. Cost: one `dlsym` and one flag.
-*What would overturn it:* a device or Android release where the flag is ignored (§6.3), or a
-`dlsym` failure — both degrade to `fork`, both still work, both are visible in the banner (D4).
+**D1 — The shipped backend is `fork` + three `dup2` + `execve`, child `_exit(127)` if `execve`
+returns.** One path, no `dlsym`, no ABI dependency, no deprecated flag.
+*Why:* this release exists to stop paying `std::process::Command`'s tax inside the reactor's
+window, and that is the whole measured win — 2.88x cheaper than `std` at the shipping footprint
+(§3.1), and still ≥2x cheaper in the three captures §9 holds up as the reproducible set.
+Everything beyond that is second-order, and the one second-order claim that carried the
+alternative — RSS independence — is a function of a resident set between 259 MB and 1.3 GB in a
+process that measures 3,876–4,020 kB and is *constructed* not to grow (its three tables are
+bounded by device process and package counts; README targets < 4 MB). At the footprint we
+actually occupy, the alternative was 240 µs better in one capture and 208 µs worse in the next
+(§9), and §5.4 keeps the rest of the argument.
+*What would overturn it:* the daemon's footprint ceasing to be bounded — a change of design, not
+a drift, which is why §8 makes the bound an acceptance criterion instead of an assumption — or a
+device where `fork` itself is the slow one. Both are visible: the first in `benchmark.sh`'s RSS
+and fd columns, the second by A/B-ing `MINI_LMK_SPAWN=std` on the device.
 
-**D2 — Fallback for API 24–27 and for any `dlsym` failure: `fork` + 3 `dup2` + `execve`,
-child `_exit(127)` if `execve` returns.**
-*Why:* `posix_spawn` cannot be linked below API 28 (§5.1), and `fork` is the right thing to
-do when the fast path is absent — 2.88x better than today, with no `dlsym`, no flag and no
-ABI dependency. It is no longer the *primary* choice (§5.4), but it stays the floor, and it
-is what D1 silently becomes when it cannot be honoured.
+**D2 — `posix_spawn` + `adddup2` + `POSIX_SPAWN_USEVFORK` is not shipped, and is not deleted.**
+It is implemented, measured and CI-compiled inside the harness at `tools/spawnprobe` (`vf`,
+`vfsweep`, `ladder`, `vfopen`, `openfd`, `fdcheck`, `execfail`), which is where §3's tables come
+from and where the code stays runnable if D1 is ever overturned. What the product declines to
+carry is a second live dispatch path.
+*Why this is a reversal:* the first draft of this section made `posix_spawn` D1 and `fork` its
+fallback, and listed `fork`-as-primary as a rejected option. Nothing about the measurements
+changed; the daemon's real footprint budget got put next to §3.2's columns instead of being
+assumed, and the decision inverted. §5.4 is the record.
 
-**D3 — `MINI_LMK_SPAWN` is a measurement surface, not a user feature.** Accepted values
-`std`, `fork`, `spawn`; unknown values resolve to `fork`, never to `spawn`.
-*Why:* `std` must stay reachable or we cannot A/B the fix against the release already
-shipped. Defaulting an unknown value to `fork` means a typo can never *add* the `dlsym` path
-to a device we did not intend to test.
+**D3 — `MINI_LMK_SPAWN` is a measurement surface, not a user feature.** Accepted values `std` and
+`fork`; anything else resolves to `fork` **and the startup line says so**, naming the value that
+was ignored.
+*Why:* `std` must stay reachable or we cannot A/B the fix against the release already shipped. A
+value that used to be valid is not the same as an unknown one: `spawn` selected a backend that
+this file spent three days measuring, and honouring the default while the operator believes their
+choice took effect is the quiet-fallback class that has burned this project twice (§9). So the
+ignore is announced, with its reason. An unrecognised value still cannot put a device onto a path
+nobody intended to test.
 
-**D4 — The startup banner prints the resolved backend, and the reason if `spawn` was
-requested but not taken.**
-*Why:* D1 has two independent silent failure modes — a `dlsym` miss and an ignored flag — and
-both degrade to `fork`, which still works. Without the banner we cannot A/B on a device we
-cannot reflash, and an ignored `USEVFORK` is indistinguishable from a slow device. This is
-also why the backend is resolved once at startup rather than per dispatch: the answer has to
-be knowable before the first kill.
+**D4 — The startup banner prints the backend actually in use, and the reason whenever it is not
+the one implied.**
+*Why:* `fork` has one silent downgrade left — `/dev/null` unavailable, which moves the daemon to
+`std` — and the other case worth an operator seeing is D3's ignored request. Resolved once at
+startup rather than per dispatch: the answer has to be knowable before the first kill, and
+per-dispatch resolution would mean a `getenv` and a string compare inside the window this release
+is trying to shrink.
 
-**D5 — Redirect stdio with `adddup2` from a cached `/dev/null` descriptor opened in
-`DaemonState::new()`, not with `addopen`.**
-*Why:* §3.4, ~8 % on the path that matters. The cost is one descriptor for the process
-lifetime, opened before the reactor starts, so there is no allocation and no `open()` inside
-an event. `addopen` is not unsafe — it was measured correct and leak-free — it is just
-slower here, and the child's `openat` failure would be invisible to us whereas a cached-fd
-`dup3` cannot fail if the fd is valid.
+**D5 — Redirect the child's stdio with three `dup2`s from a cached `/dev/null` descriptor opened
+in `Spawner::new()`, and do not run `fork` without one.**
+*Why:* §5.3 is the failure mode of not redirecting — `cmd activity kill` writing into the
+operator's terminal and possibly consuming its stdin, observed concretely as an AMS Java stack
+trace landing on the probe's stdout. The descriptor is opened before the reactor starts, so there
+is no `open()` and no allocation inside an event. If it cannot be opened, the backend becomes
+`std`, whose own `Stdio::null()` does the job correctly; dispatching with `dup2(-1, fd)` would
+turn every kill into a silent `exit(127)` *and record it as a success*, which is the one failure
+mode this design cannot afford.
+*Correction:* the first draft justified the cached descriptor with §3.4's ~8 %
+`adddup2`-over-`addopen` margin. That margin was priced on the `vfork` path, where the child's
+`openat` calls land inside the parent's suspended window; under `fork` the parent waits for none
+of it, so the 8 % does not transfer and is withdrawn here. The cached descriptor stays for the
+reason above, not for latency.
 
 **D6 — Telemetry: replace the kill record's `spawned: bool` with `spawn_errno`, and say in
 the docs exactly what it can prove (§6.2).**
 *Why:* a boolean cannot distinguish "we did not try" (`--observe`, or the AMS guard skipping
 a low-UID package) from "we tried and the kernel refused". The sentinel scheme is: `None` =
 no dispatch attempted (observe mode), `-2` = skipped by the AMS guard, `0` = dispatched,
-positive = the OS errno from `posix_spawn`/`clone`. It deliberately does **not** promise to
+positive = the OS errno from `clone` (via `fork`) or from this module's own refusals. It deliberately does **not** promise to
 carry `ENOENT`.
 
 **D7 — Do not change what gets dispatched.** Still `/system/bin/cmd activity kill --user all
@@ -276,17 +312,20 @@ ld.lld: error: undefined symbol: posix_spawn_file_actions_init
 
 The identical source links cleanly against `aarch64-linux-android28-clang`. So the block
 is the link-time symbol floor — not a language gap, not a missing declaration, not a
-load-time failure, and not something a `cfg` can paper over. `dlsym` at startup is the
-only way to have the fast path on API 28+ and still ship an API 24 binary.
+load-time failure, and not something a `cfg` can paper over. `dlsym` at startup was the only
+way to have that fast path on API 28+ and still ship an API 24 binary — which is precisely the
+tax §5.4 refuses to pay: a resolver, a probe of its own results, and a complete `fork` fallback
+that is the *only* path on the API 24–27 devices. The harness still works this way, so its
+numbers stay reproducible on old hardware.
 
 ### 5.2 Raising the minimum supported API from 24 to 28 to make the `dlsym` go away
 Rejected as a product decision. README.md:3 and `docs/ARCHITECTURE.md`:3 advertise Android
 7.0+ (API 24+), and `src/main.rs` implements genuine pre-29 paths (`dumpsys power` parsing
 instead of `cmd deviceidle get screen`, HOME-category resolution instead of `RoleManager`,
 3-token versus 4-token event formats). Dropping to 28 deletes Android 7.0–8.1 support to
-avoid one `dlsym`. Now doubly not worth it: D1 resolves the symbol at runtime and needs no
-floor change. If anyone proposes it again, the answer is "it costs a supported release and
-buys nothing D1 does not already provide".
+avoid one `dlsym`. If anyone proposes it again, the answer is that it costs a supported release
+and buys nothing: D1 is `fork`, which every libc has exported forever, so there is no floor to
+raise and no symbol to resolve.
 
 ### 5.3 `posix_spawn` with NULL `file_actions`
 It is the fastest number in §3.1 (1,324 µs) and it is unshippable: with no file actions the
@@ -296,15 +335,37 @@ invisible because stdout is redirected; in an interactive `--act` run at a termi
 concrete failure during measurement — an AMS Java stack trace landed on the probe's own
 stdout. Correctness before 250 µs.
 
-### 5.4 `fork` + `dup2` + `execve` as the primary backend
-**This was this roadmap's original choice, and it is superseded.** It is still correct,
-still 2.88x better than today, and still the fallback (D2) — but §3.2 shows its stall is a
-function of our own resident memory (19.1x from 3 MB to 1.3 GB), so its worst case lands
-exactly where the daemon is least able to pay for it. It stays in the tree precisely
-because it has no ABI dependency at all.
+### 5.4 `posix_spawn` + `adddup2` + `POSIX_SPAWN_USEVFORK` as the primary backend
+**This was D1 of the first draft; it is now the rejected option, and it is the one the product
+does not run.** Nothing about it is broken — it is implemented, measured and RSS-immune, and it
+still lives in `tools/spawnprobe`, where §3.2's flat 0.9x row is generated from it on demand. What
+killed it for the daemon is that its whole advantage is a function of the parent's resident set,
+and this daemon's resident set is bounded:
+
+* At 3 MB it measured 1,387 µs against `fork`'s 1,627 µs; the next two captures of the same mode
+  on the same device put the pair at 0.84x and 1.22x — the order is not a reproducible fact (§9).
+  There is no ship-worthy margin at the footprint we occupy, only at the footprints we cannot
+  reach.
+* `posix_spawn_file_actions_adddup2`, `posix_spawnattr_setflags` and `posix_spawnattr_getflags`
+  are `__INTRODUCED_IN(28)` in the NDK while the shipped floor is API 24 — set not in
+  `Cargo.toml` (which carries no SDK key) but by the `*-android24-clang` linker wrappers in
+  `.cargo/config.toml`, for all four ABIs (§5.1, §5.2). So the
+  backend can never be alone: it carries eight `dlsym` lookups *and* a complete `fork` fallback,
+  and on API 24–27 devices the fallback is the only thing that runs. Two code paths, one of which
+  is the code we already have.
+* It rests on a flag that is deprecated in POSIX and a no-op on glibc ≥ 2.24 (§6.3), so it needs
+  re-verifying against every Android release — and the verification is a lie if you read it from
+  the API: `posix_spawnattr_setflags` *stores* 0x40 even where the flag is ignored, so the
+  readback proves nothing and the only honest evidence is the latency shape, which §9 shows is
+  noisy to the point of flipping sign.
+* The host suite — the only place an ABI mistake can be caught automatically — could not test it.
+  glibc's `posix_spawn` accepted three `adddup2` actions and then ignored them: the child's fd 1
+  and fd 2 stayed on the test harness's capture pipe while the `fork` path in the same binary
+  redirected all three to `/dev/null`. A backend whose correctness test passes on one libc and
+  silently no-ops on another has decoration for a test.
 
 ### 5.5 Hand-written `clone(CLONE_VM|CLONE_VFORK)` with an inline-asm child
-8.3 % faster than D1 (1,272 vs 1,387 µs) and rejected. Costs: aarch64-only, so every future
+8.3 % faster than `USEVFORK` (1,272 vs 1,387 µs) and rejected. Costs: aarch64-only, so every future
 ABI needs its own trampoline; the child runs on a shared stack, so it may touch nothing but
 its own buffer and kernel descriptors, and any Rust codegen that spills is a parent
 corruption; and it re-implements the `returns_twice` contract that is precisely why Bionic's
@@ -321,10 +382,11 @@ not measured" is a backend whose failure mode is "quietly not shipped".
 Dead in the only deployment we ship. On the reference device `id` reports
 `uid=2000(shell) gid=2000(shell) context=u:r:shell:s0`, and `kill -0` against both
 `system_server` and an app PID fails with `Operation not permitted`.
-`docs/ARCHITECTURE.md`:132 already documents that stock SELinux policy denies direct signal
-delivery from `u:r:shell:s0` to third-party app domains — which is *why* eviction is
-delegated to `cmd activity kill` in the first place. Three further reasons it would be wrong
-even as root, all traceable to documented invariants (`docs/ARCHITECTURE.md`:128–136):
+`docs/ARCHITECTURE.md` §1.5 ("SELinux Permission Boundary") already documents that stock SELinux
+policy denies direct signal delivery from `u:r:shell:s0` to third-party app domains — which is
+*why* eviction is delegated to `cmd activity kill` in the first place. Three further reasons it
+would be wrong even as root, all in the same §1.5 invariant list (cited by section, not by line
+number, because line numbers rot the first time an unrelated bullet is added):
 `--user all` is what covers secondary users, work profiles and cloned apps; AMS terminates
 only cached or dormant processes, so saved instance state, notifications, push tokens and
 scheduled alarms survive; and the fail-closed low-UID guard exists because AMS will
@@ -380,17 +442,27 @@ thread count, not memory size.
 
 ## 6. Constraints that bind the implementation
 
-### 6.1 The single-threaded invariant is load-bearing, not stylistic
-`CLONE_VM` shares the address space, so the child reads `argv`, `envp` and the file-actions
-object *from our own memory* while the parent is suspended. That is safe only if nothing else
-in the process can write them in that window. Today nothing can: the daemon has one thread
-(`Threads: 1` observed on device) and the dispatch staging buffers are touched only by the
-reactor. **Any future change that adds a thread, a Tokio runtime, or a lock held across the
-spawn must be reviewed against this section.** The same rule is why `libc::vfork()` is not an
-option in Rust: correct codegen for a returns-twice function depends on the C
-`returns_twice` attribute, `#[ffi_returns_twice]` is unstable and absent from `libc::vfork`,
-and under `lto = "fat"` / `opt-level = "z"` LLVM may spill into the shared stack. D1 avoids
-the problem by letting Bionic's own wrappers keep that contract.
+### 6.1 The single-threaded invariant: load-bearing for `vfork`, ordinary hygiene for `fork`
+`CLONE_VM` shares the address space, so a `vfork`-style child reads `argv`, `envp` and the
+file-actions object *out of our own memory* while the parent is suspended. That is safe only if
+nothing else in the process can write them in the window, which is why §5.4 and §5.5 each carry
+this section as a precondition.
+
+**D1 does not need it.** `fork` hands the child a copy, so a second thread could not corrupt the
+child's arguments; what it could still do is the normal `fork`-in-a-threaded-process damage
+(holding a lock the child's `dup2` or `execve` needs), which is why the child touches nothing but
+three descriptors and one `execve` and then `_exit`s. The daemon is single-threaded today
+(`Threads: 1` observed on device) and §8 keeps asserting it, for two reasons that are not about
+address spaces: Bionic's `fork` runs `__bionic_atfork_run_prepare`/`_parent`/`_child` around the
+`clone` — five PLT hops and an fdtrack/stack-guard reset in the child, priced in the parent's
+window — and every measurement in §3 was taken under that invariant, so a change to it invalidates
+the table as well as the reasoning.
+
+The `returns_twice` note stays on file for whoever revisits `vfork` in Rust: correct codegen for a
+returns-twice function depends on the C `returns_twice` attribute, `#[ffi_returns_twice]` is
+unstable and absent from `libc::vfork`, and under `lto = "fat"` / `opt-level = "z"` LLVM may spill
+into the shared stack. That is the reason §5.4 was attractive when it was D1 — it let Bionic keep
+that contract — and one less reason to miss it now that it is not.
 
 ### 6.2 Exec failure is asynchronous, so `spawn_errno` cannot report `ENOENT`
 Measured with an `execfail` probe mode: spawning a nonexistent binary with `posix_spawn`
@@ -411,6 +483,10 @@ The docs must state this precisely, because the original pitch ("so `ENOENT` and
 distinguishable") is a promise this design cannot keep.
 
 ### 6.3 `POSIX_SPAWN_USEVFORK` is a Bionic extension and must be re-verified per release
+**Scope: `tools/spawnprobe`, and anyone revisiting §5.4. Not the shipped daemon, which never sets
+this flag.** The section survives because the measurements below are how §3's `USEVFORK` rows were
+validated and because the reasoning is expensive to redo.
+
 It is deprecated in POSIX and a documented **no-op on glibc ≥ 2.24** (glibc's `posix_spawnp`
 already uses `clone3(CLONE_VM|CLONE_VFORK)` by default, which is why the Kobzol article that
 validated our cheap-parent numbers reports `USEVFORK` changing nothing on Linux — on *that*
@@ -450,68 +526,169 @@ because a release that ignores the flag silently costs us 36 ms at 1.3 GB rather
 * `libc` for Android types `posix_spawn_file_actions_t` as `*mut c_void` and declares none of
   the spawn functions, so all of
   `posix_spawn`, `posix_spawn_file_actions_{init,adddup2,destroy}` and
-  `posix_spawnattr_{init,setflags,getflags,destroy}` are `dlsym`'d, and the actions object is an
-  *opaque pointer-sized handle whose size we cannot see from the header*. Size the buffer for the
-  larger glibc layout (`[usize; 32]` = 128 B on LP64 glibc, 8 B on Bionic; glibc's real object is
-  80 B) so host-Linux tests exercise the same code as the 32-bit ABIs.
+  `posix_spawnattr_{init,setflags,getflags,destroy}` have to be `dlsym`'d, and the objects are
+  *opaque handles whose size is invisible from the header*. Size any buffer for the largest
+  implementation, not the one you are linking against: measured on an aarch64 glibc 2.43 host,
+  `sizeof(posix_spawnattr_t)` is **336 B** and `sizeof(posix_spawn_file_actions_t)` is 80 B, while
+  Bionic's are pointer-sized. The size varies by libc *and* ABI, so it cannot be pinned at compile
+  time and the buffer is deliberately over-allocated (512 B). (An earlier bullet here asserted `[usize; 32]` was "256 B on LP64
+  glibc"; LP64 `usize` is 8 B, so 32 of them are 256 B and the attribute object needs 336 — the
+  buffer was 80 B short of its own comment.) This is what `tools/spawnprobe` had wrong: its objects
+  were single `*mut c_void` slots, so `spawnprobe vf` on an x86-64 host wrote 336 B into 8 B of
+  stack. Fixed to `[usize; 64]` (512 B) buffers, which the host `vf` run now executes inside.
+  The shipped daemon allocates neither object, because D1 does not call `posix_spawn`.
 * `libc::WIFEXITED` / `libc::WEXITSTATUS` are `pub const fn`, callable from inside an
   `unsafe` block; `libc::kill` and `libc::geteuid` are generated as unsafe functions.
 
 ### 6.5 The host test suite is load-bearing, not a convenience
-CI runs `cargo test` on an Ubuntu host, so the `dlsym` dispatcher, the `fork` path and the
-actions-buffer sizing are all exercised against glibc, which is the only place a `posix_spawn`
-ABI mistake can be caught without a device. Two rules follow: tests that would dispatch a real
-`cmd activity kill` must be gated `#[cfg(not(target_os = "android"))]` (on device
-`/system/bin/cmd` exists, so a "missing binary" assertion would kill something), and the spawn
-tests must not rely on fd-number stability across threads — the daemon is single-threaded but
-`cargo test` is not, so a `Spawner` whose `Drop` closes the cached `/dev/null` descriptor lets
-a concurrent test recycle that number before another test's redirect runs. That flake
-(`test_fork_backend_executes_and_reaps`) is a harness artifact, not a daemon bug — but it must
-be handled in the harness (`--test-threads=1` for the spawn module's tests, or a `static`
-descriptor that is never closed) rather than by weakening the assertion.
+CI runs `cargo test` on an Ubuntu host, so the `fork` dispatcher, the `execve` failure mode and the
+stdio redirect are all exercised against glibc — the only place any of it can be checked without a
+device. Three rules fall out, each paid for in a failed test:
+
+* **Gate anything that could really kill something.** A "missing binary" assertion is a live
+  `cmd activity kill` on a device, where `/system/bin/cmd` exists. Those tests are
+  `#[cfg(not(target_os = "android"))]`, and the cfg is the safety device, not the organisation.
+* **Wait for the `execve` before inspecting a child.** Reading `/proc/<pid>/fd` straight after
+  `fork` shows the *parent's* descriptors, because the child has not reached its `dup2`s yet. With
+  the redirect correct the test saw the harness's capture pipe on fd 1 and 2 and reported a leak;
+  with the harness's stdin already `/dev/null`, fd 0 looked right. It could just as easily have
+  passed on a broken redirect. The barrier is `/proc/<pid>/cmdline`, which `execve` rewrites and
+  nothing else does — a `sleep` before the read is not a barrier, it is a coin flip.
+* **Never take a process-wide census inside a parallel test binary.** The descriptor test asserted
+  "startup costs exactly one fd" and then "twenty dispatches leaked nothing", and the second
+  reading came out *lower* than the first: every test in the binary shares one fd table, and the
+  unrelated churn
+  around the measurement drained while it ran. Sampling the minimum over eight reads does not
+  help, for the same reason. The in-process test now asserts *identity* — our descriptor is open,
+  is not one of the std slots, and is the same number after twenty dispatches — and the drift
+  census happens where the claim can be seen at all: a quiescent daemon under
+  `scripts/benchmark.sh`, §7 item 5. Note the mode that script runs, because it changes what the
+  census proves: by default it samples an `--observe` daemon, which never calls `spawn_kill()`, so
+  the verdict covers the startup descriptor and the thread count and **not** a per-dispatch leak.
+  The dispatch half needs `--daemon-mode act`, which really kills the apps under test and so is
+  opt-in. Asserting "stable across dispatches" from an observe-mode census is the same mistake as
+  the cross-run comparison above, made in the other direction.
+  Also relevant: a `Spawner` whose `Drop` closes the cached `/dev/null` lets a concurrent test
+  recycle that number under another test's redirect, which is the flake this section was written
+  about the first time.
 
 ## 7. What v1.5.0 actually changes
 
-1. **New module `src/spawn.rs`** owning the dispatch: a `Backend { Std, Fork, PosixSpawn }`
-   enum and a `Spawner` that holds the resolved function pointers, the cached `/dev/null`
-   descriptor, the retained `CString` staging and a fixed-width `argv`. `spawn_kill(pkg)`
-   returns a `c_int`: `0` dispatched, positive OS errno, `-1` other, and a `NOT_DISPATCHED`
-   sentinel (`-2`) for the AMS-guard skip. Resolution happens once, in `DaemonState::new()`.
-2. **`src/main.rs`** gains `mod spawn;`, a `spawner` field on `DaemonState` (both
-   `new()` and the test-only `daemon_for_test()`), the D4 banner, and the dispatch loop calls
-   `self.spawner.spawn_kill(pkg)` instead of building a `Command`.
-3. **Telemetry**: `"spawned": bool` becomes `"spawn_errno": i32` with the §6.2 semantics
-   documented in `docs/ARCHITECTURE.md`, not just in the code.
-4. **Tests**: `Backend::parse` coverage including the unknown-value-goes-to-`fork` rule; the
-   fork path executing and being reaped on the host; the child's stdio actually redirected
-   (via `readlink /proc/$$/fd/N` in a shell — *not* `/proc/self/fd/N`, which reports the
-   `readlink` child's own descriptors and silently passes for the wrong reason); NUL-in-name
-   rejection; `posix_spawn` `ENOENT` on a missing binary where available; and the staging
-   invariant that `argv` never reallocates.
-5. **`scripts/benchmark.sh` reports the daemon's `VmRSS`** beside the existing `/proc/<pid>/fd`
-   census, and `docs/ARCHITECTURE.md` states the one sentence that explains why (§2(a)). This
-   is a regression watch, not a latency lever, and §5.9 says so.
+1. **New module `src/spawn.rs`** owning the dispatch: a `Backend { Std, Fork }` enum and a
+   `Spawner` holding the backend, the startup note if it was degraded, the cached `/dev/null`
+   descriptor, the package-name buffer and the `envp` copied once at startup. `spawn_kill(pkg)`
+   returns a `c_int`: `0` dispatched, positive OS errno, `-1` refused by this module, and the
+   `NOT_DISPATCHED` sentinel (`-2`) for the AMS-guard skip. `spawn_path` stages `argv` into a
+   fixed `[*const c_char; 8]` on the stack, so there is nothing to reallocate and nothing to
+   overflow: an argument list that does not fit is refused, not truncated, and the compile-time
+   guard for that is `ARGV_FIXED + KILL_ARGS.len() < ARGV_SLOTS` - the weaker `ARGV_SLOTS >
+   ARGV_FIXED` it used to carry would have let a fifth fixed argument make *every* dispatch fail.
+   The backend is chosen once, in `DaemonState::new()`. The child runs one extra step before
+   `execve`: `close_inherited()` closes every descriptor above stdio, because `fork` copies the
+   whole table -- including anything the *launcher* handed us that is not close-on-exec -- while
+   `std::process::Command` closes those for us. It costs the reactor nothing (the parent has
+   already returned from `fork`), and without it the shipped path would differ from v1.4.0 in
+   exactly one way (§10). It has two routes: the `close_range(2)` syscall (Linux 5.9+; Bionic only
+   exports the *function* from API 34, four major levels above this project's API 24 floor, so the
+   number is issued
+   directly), and a blind `close` walk bounded by `RLIMIT_NOFILE` and capped at 4096 for the older
+   kernels still in service. The fast path is *checked*, not trusted: after the syscall, our own
+   cached descriptor must be closed, and if it is not the sweep falls through to the walk. That
+   condition is load-bearing -- with a deliberately wrong syscall number (one that also returns 0)
+   the descriptor test passes with the check and fails without it, which is the only way this file
+   can know a hardcoded number worked.
+2. **`src/main.rs`** gains `mod spawn;`, a `spawner` field on `DaemonState` (both `new()` and the
+   test-only `daemon_for_test()`), the D4 banner, and the dispatch loop calls
+   `self.spawner.spawn_kill(&pkg)` instead of building a `Command`.
+3. **Telemetry**: `"spawned": bool` becomes `"spawn_errno": i32` with the §6.2 semantics, built by
+   a `KillRecord::to_json()` and documented in `docs/ARCHITECTURE.md`, not just in the code.
+   `spawn_skipped` survives, but as a *derived* field rather than a second stored copy of the same
+   fact: `KillRecord::spawn_skipped()` is true when `spawn_errno` is `None` (observe mode, no
+   dispatch attempted) or `Some(NOT_DISPATCHED)` (the guard declined). The order matters here - the
+   naive rule `== Some(NOT_DISPATCHED)` reports `false` in the mode the daemon ships in by default,
+   which is the mistake this clause used to document as intentional. `kill_record_json_reports_which
+   _of_its_four_states_spawn_errno_is` asserts the four states and checks the derivation against the
+   pipeline's own `!act_mode || ams_protected` for all four combinations; `dispatch_outcomes_are_the
+   _codes_the_telemetry_documents` is the separate claim that the *return codes* (`0`, `EINVAL`,
+   `-1`) are what the field documentation says they are — and that `0` means the same thing on
+   both backends, not only on the shipped one.
+4. **Tests** (`src/spawn.rs`, 13 of them, 46 → 60 for the binary): `Backend::parse` accepting only
+   the two real names; construction annotating only what it has to; the fork path launching,
+   redirecting and being reaped; NUL-in-name refusal; `argv` staging exactness and the
+   never-reallocates claim; the missing-binary case as a `cfg`-gated documentation of §6.2; the
+   outcome codes being the ones the telemetry claims; a `/dev/null` open that failed degrading to
+   `Std` instead of disabling dispatch forever; and the descriptor identity check that §6.5
+   explains in full, plus the inherited-descriptor claim above (which fails, reporting `[3]`, if
+   the sweep is removed). One more lives beside the record it tests, in `src/main.rs`:
+   `kill_record_json_reports_which_of_its_four_states_spawn_errno_is`.
+5. **`scripts/benchmark.sh`** samples the daemon's `VmRSS`, its `/proc/<pid>/fd` count and its
+   `Threads:` on every iteration, and prints a **drift verdict** rather than a number:
+   `STEADY-STATE CENSUS (observe mode): stable at N descriptors / 1 threads over M samples`, or
+   `DRIFT -- fds 5..7` with a warning that every latency row above it is now suspect. Flatness is
+   the property being asserted (D5's descriptor must appear exactly once and then never move),
+   which is why the verdict compares min against max instead of quoting a mean. All three land in
+   `--csv`, `--json` (`"drift":N`) and `--markdown`. The verdict **names the daemon mode it
+   sampled**, because the default `--observe` never reaches `spawn_kill()`: what it proves is the
+   startup descriptor and the thread count, and `--daemon-mode act` is the flag that turns it into
+   a real dispatch census — deliberately not the default, because an `--act` benchmark kills the
+   apps it is measuring. §6.5 is why the split exists at all, and `docs/ARCHITECTURE.md` gains the
+   sentence explaining why RSS and descriptors are reported together (§2(a)).
 6. **Deferred, deliberately:** the empty-`envp` change (§3.3) is a measured ~90 µs today and a
-   ~500 µs win only if the inherited environment is large. It is a second variable in a release
-   that already changes the launcher, and its safety argument is per-target ("`cmd` reaches AMS
-   with `env -i` on this device"), which is the weakest kind. Revisit with a device-side matrix
-   once the backend is settled.
+   ~500 µs win only if the inherited environment is large. Under D1 it is *not* inside a
+   suspended parent, so the §3.3 slope argument mostly evaporates for the shipped path; it stays
+   in the probe as a mode, and stays out of this release.
 
 ## 8. Acceptance criteria
 
-* On the reference device with the real target, the kill-dispatch `[parent]` P50 is under
-  1,600 µs at shipping footprint **and** under 2,000 µs at 1 GB of daemon RSS. The second
-  clause is the point of the release; a backend that passes only the first is a regression
-  dressed as a win.
-* `MINI_LMK_SPAWN=std` still works and lands in the 2.9–5.4 ms band that §9 documents for
-  absolute `[parent]` P50s of the std row (2,868 / 3,736 / 4,681 / 5,386 µs across four
-  captures of the same device), so the A/B is honest without promising a reproducibility
-  that this device does not offer.
-* The startup banner distinguishes `spawn` (fast path live) from `fork` (fallback, with reason).
-* No new descriptor, no new thread, no allocation inside the dispatch loop: the `/proc/<pid>/fd`
-  census and `Threads: 1` must read as they do today.
-* `cargo test`, `cargo clippy --release --all-targets` and `cargo fmt` stay at their baselines
-  (119 fmt hunks).
+* **Relative, not absolute, because absolutes do not reproduce (§9).** On the reference device
+  with the real target, in one process, the kill-dispatch `[parent]` P50 selected by
+  `MINI_LMK_SPAWN=fork` must be at least 2x below the `MINI_LMK_SPAWN=std` P50 of the same run —
+  the gap §9 confirms survived all three captures. As a sanity band rather than a gate, the `fork`
+  row should land inside 0.5–2.0 ms, which is where every capture of it has been (785, 854, 1,627
+  µs from the three `60 cmd vf` runs; 1,885 µs is §3.2's 3 MB row, a different loop).
+  *Why this replaced the old clause:* the first draft demanded "under 2,000 µs at 1 GB of daemon
+  RSS" as the point of the release. That criterion is unsatisfiable by D1 — §3.2 measured
+  35,929 µs at 1.28 GB — and was written when `USEVFORK` was D1. Keeping it would have made the
+  shipped design fail its own acceptance test, so the requirement moved from the *spawn path* to
+  the *footprint*, where it can be measured (next bullet).
+* **The bound that makes that trade legal:** the daemon's `VmRSS` stays under 8 MB under the
+  5-minute `benchmark.sh` app-switch traffic, reported beside the fd census (§7.5). D1 buys 2.88x
+  over `std` and knowingly gives up RSS-independence: `fork`'s stall grows 19.1x between 3 MB and
+  1.3 GB (§3.2). That is a good trade only while the footprint is bounded, so the bound is now
+  something the release measures rather than something it assumes — and breaking it is the
+  trigger to revisit §5.4, whose implementation is still runnable in `tools/spawnprobe`.
+* `MINI_LMK_SPAWN=std` still works and lands in the 2.9–4.7 ms band that §9 documents for the
+  `std` row against the real target: 4,681 µs (§3.1, the pre-vendoring capture, no archived
+  output), 3,736 µs and 2,868 µs (both archived, `~/durable/vf_cmd_clean*.txt`). So the A/B is
+  honest without promising a reproducibility this device does not offer. An earlier draft of this
+  clause listed a fourth capture at 5,386 µs; no archived run contains that number, and §10 now
+  records the rule it broke.
+* The startup banner names the live backend, and announces in the same breath any `MINI_LMK_SPAWN`
+  value it refused (`D3`) and any downgrade it took (`D4`): `fork` alone must not be able to mean
+  "as designed", "because your request made no sense" and "because `/dev/null` was unavailable".
+* Exactly one new descriptor for the process lifetime, opened in `DaemonState::new()` before the
+  reactor starts and **stable across dispatches**; no new thread; no allocation in steady state
+  inside the dispatch loop (the fixed `argv` cannot reallocate, and the package-name buffer grows
+  only when a longer name than any seen before arrives). Two gates, because one script cannot
+  cover both halves: the *per-dispatch* half is asserted in-process by
+  `the_cached_descriptor_is_ours_and_survives_every_dispatch` (twenty real `fork`+`dup2`+`execve`
+  dispatches, identity rather than a count, for the reason in §6.5), and the *long-run drift* half
+  by `scripts/benchmark.sh`, whose descriptor count and `Threads:` must be **flat across every
+  sample of the run** (`drift == 0`). The fd appears once at startup and the claim is about it
+  never moving, so an absolute count would be a number nobody can interpret without knowing the
+  config. Nothing in that sentence covers descriptors the child *inherits*: `fork` copies the
+  launcher's table wholesale, so `close_inherited()` closes everything above stdio in the child
+  before `execve` (item 1, §10) and
+  `the_child_carries_no_descriptor_the_parent_did_not_mark_close_on_exec` asserts it with a raw
+  non-`CLOEXEC` descriptor opened in the test process. (`benchmark.sh` runs `--observe` unless given `--daemon-mode act`, and an observe-mode
+  verdict therefore says "steady-state", not "dispatch" — see §7.5; "No new descriptor" was the
+  original wording of this bullet, which contradicted D5 and is gone.)
+* `cargo clippy --release --all-targets` stays at 0 warnings, `cargo fmt` at or below its baseline
+  (119 hunks committed, 116 after this change — the files this release touches had unformatted
+  lines of their own before it, and `src/spawn.rs` contributes zero), and `cargo test` only ever gains tests (46 → 60).
+* `sh scripts/check-benchmark-sh.sh` passes: the benchmark script's reporting half is executed
+  under `dash` as well as bash and must print byte-identical reports, because a bash-only check
+  had already passed a script that could not finish on the device (§9).
 
 ## 9. Measurement hygiene, so the next reader does not repeat our mistakes
 
@@ -541,6 +718,19 @@ The ways it lied to us, in order of how long each cost us:
   reclaimed mid-investigation, twice; this file's own predecessor was overwritten by a stale
   snapshot restore. The probe crate is now in git, so the *harness* survives; the captures do
   not, which is why the tables here remain the record. Transcribe, then commit.
+* **A knob whose set of valid values shrinks must say so.** `MINI_LMK_SPAWN=spawn` was a real
+  backend for three days. After D2 it was not, and the code quietly resolved it to `fork` — so a
+  device left with that value in `service.sh` would have reported "fork" in the banner, which is
+  true, while the operator believed they were measuring the `USEVFORK` path, which is not. The fix
+  is one line of output naming the ignored value (D3), and it is the same class as every other
+  silent fallback this file has recorded: the failure is not a crash, it is a *reading you believed
+  that the machine never made*.
+* **Do not buy insurance against a footprint you have not measured.** §3.2's columns (3 MB, 259 MB,
+  1.3 GB) sat in this file next to a decision before anyone put the daemon's actual resident set
+  beside them: 3,876–4,020 kB under live traffic, P50 1,099 kB PSS, README budget < 4 MB, tables
+  bounded by device process and package counts. The 26x figure that drove D1 is true at 1.3 GB and
+  irrelevant at 4 MB. Whenever a measurement is used to justify a design, quote the operating point
+  in the same breath as the curve.
 * **Absolutes do not reproduce — and neither does one published ranking.** Three captures of
   the *same mode* on the same device (`60 cmd vf`, API 34, `Threads: 1`, `AnonHugePages` and
   `Swap` 0 kB, load average 12.8–14.7; the first with the pre-vendoring binary, the next two
@@ -550,13 +740,37 @@ The ways it lied to us, in order of how long each cost us:
   272 → 167 → 137 µs. More damaging than the drift: the ratio §3.1 quotes, "`USEVFORK` is a
   further 1.17x over `fork`", measured 0.84x then 1.22x. At shipping footprint those two
   backends are within device noise of each other, and their *order* is not a reproducible fact.
-  What survived all three captures is the ≥ 2x gap to `std` and the §3.2 footprint sweep
-  (`fork` 19.1x, `USEVFORK` flat) — which is where D1's rationale actually sits, and why §3.1
-  is context rather than evidence. Two rules: do not promote a same-footprint ranking of two
-  backends less than ~1.2x apart, and never quote `std` as a single number (the same capture has
+  What survived all three captures is the ≥ 2x gap to `std` — which is D1's entire rationale,
+  and the reason §8's latency gate is written as a ratio to a same-run `std` measurement — and
+  the §3.2 footprint sweep (`fork` 19.1x, `USEVFORK` flat), which is a true statement about
+  mechanism and, at this daemon's bounded footprint, not a reason to buy anything. Two rules: do
+  not promote a same-footprint ranking of two backends less than ~1.2x apart, and never quote
+  `std` as a single number (the same capture has
   P50 2,868 µs against P99 6,644 µs). Read any fresh absolute as "this device, right now" —
   which is why every run now prints its own load average, RSS, thread count, API level,
   `AnonHugePages`, `Swap` and `Seccomp` beside the rows.
+
+* **An example record is a claim, and it has to be checked against the derivation.** The
+  `simulated_kill` row in `docs/ARCHITECTURE.md` carried `"spawn_errno": null` beside
+  `"spawn_skipped": false` for a whole release cycle. That pair is not producible: `spawn_skipped` is
+  derived from `spawn_errno`, and `null` means "observe mode, nothing attempted", which *is* skipped.
+  The example had been correct under v1.4.0's two independent fields and went impossible when the
+  fields were unified - the same trap as any hand-typed JSON in prose. Derive the example from the
+  code, or assert it in a test (`kill_record_json_reports_which_of_its_four_states_spawn_errno_is`
+  now pins all four rows).
+* **A gate that accepts more than the target does is not a gate.** `scripts/benchmark.sh`
+  begins `#!/system/bin/sh` — toybox ash on the device — and every verification round up to the
+  last one checked it with `bash -n`, which tests syntax while the shells disagree about
+  substitution at *run* time. The census verdict line used `${CENSUS_KIND^}`: bash upper-cases
+  the first letter, ash aborts with `Bad substitution` (exit 2) — after all the measurement work
+  was done, so an on-device run printed its tables and died before its verdict. `dash -n` catches
+  nothing either (exit 0); the only check that sees this class of bug is *executing* the file
+  under a shell that is not bash. `scripts/check-benchmark-sh.sh` now does that in CI: synthetic
+  samples, all four output formats, both verdict arms, byte-identical output required from dash
+  and bash. Against the pre-fix script it reports 13 failures; against this one, none. Worth
+  recording: the review pass that found the duplicated table suggested rewriting that same line as
+  `${CENSUS_KIND^^}`, which would have deepened the bug it was cleaning up. A simplification is
+  only safe once someone has established what the target accepts.
 
 ## 10. Claims that must not be repeated
 
@@ -564,8 +778,10 @@ Kept because they were in a draft of this file, or in a pitch, and are now known
 
 | claim | why it is false |
 |---|---|
-| "`fork` is 2.55x cheaper than `std`, so `fork` is the backend" | the ratio is 2.88x at shipping footprint, and the decision it justified is wrong: `fork`'s stall is a function of our own RSS (19.1x from 3 MB to 1.3 GB) while `USEVFORK`'s is not a function of anything we control |
-| "`posix_spawn` ties `fork`, so it is not worth it" | the tie was Bionic secretly running `fork()`; with `USEVFORK` it is 1,375–1,537 µs at every footprint vs 1,885–35,929 µs |
+| "`fork` is 2.55x cheaper than `std`, therefore `fork` is the backend" | the ratio is wrong (2.88x at shipping footprint, and the *order* of the top two backends flips between captures, §9) and the reasoning was wrong in the other direction too — `fork`'s stall is a function of our own RSS (19.1x from 3 MB to 1.3 GB). D1 ships `fork` anyway, because the RSS term is bounded near 4 MB and §8 makes that bound a measured criterion |
+| "`fork`+`dup2`+`execve` is a rejected option" (this file's own §5.4, first draft) | reversed by D1. The rejection was of `fork`-*as-primary-because-cheap*; what is actually rejected now is carrying it as a *fallback* to a `posix_spawn` primary (§5.4), which is how the same code ended up on both sides of the table |
+| "`posix_spawn` ties `fork`, so it is not worth it" | as a measurement, false: the tie was Bionic secretly running `fork()`, and with `USEVFORK` it is 1,375–1,537 µs at every footprint vs 1,885–35,929 µs. As a conclusion it happened to be right, for a reason nobody had found yet — see the next row |
+| "therefore `posix_spawn` + `USEVFORK` must be the primary backend" | the flat curve only pays where the parent is big; at 3 MB the gap to `fork` is inside capture-to-capture noise (§9), while the cost is a permanent `dlsym` + fallback pair (§5.4) for symbols that do not exist before API 28 |
 | "`std::process::Command` on Android is vfork-based / RSS-immune" | strace shows plain `clone` with no `CLONE_VM`; in-process it grows 5,277 → 90,473 µs |
 | "`Command::spawn` doubles the FD count via a socketpair" | zero `socket`/`socketpair` in a syscall-filtered strace; `fds_during_spawn=4` |
 | "`addopen` leaks a parent descriptor" | `fds_before=5 fds_after=5` over 80 dispatches, including the failed-exec case; it loses on cost, not correctness |
@@ -573,8 +789,12 @@ Kept because they were in a draft of this file, or in a pitch, and are now known
 | "`spawn_errno` will let us tell `ENOENT` from `EAGAIN`" | exec failure is asynchronous (`rc=0` + exit `127`); see §6.2 |
 | "the vfork window scales with the child binary" | 1,272 µs for the 46 KB `cmd` vs 1,342 µs for a 1.6 KB `true` — 29x the size, 6 % apart, larger one faster, while the children's own lifetimes were 18.9 ms and 30.4 ms |
 | "POSIX_SPAWN_USEVFORK does nothing" (from the glibc article) | true on glibc ≥ 2.24, false on Bionic, where the branch is before the actions check |
+| "glibc and Bionic will behave the same in a `posix_spawn` test" | on the host, `posix_spawn` accepted three `adddup2` file actions and ignored them — the child kept the test harness's capture pipe on fd 1 and 2 while the `fork` path redirected all three correctly. The same call is a no-op and an implementation depending on which libc compiled it (D5, §5.4) |
+| "`posix_spawnattr_getflags` reading back 0x40 proves the vfork path was taken" | the flag is *stored* even where it is ignored (verified on glibc, which no-ops it by design). The readback is a memory test; only the latency shape is evidence, and §9 shows that shape is noisy |
 | "a 60–110 µs dispatch is achievable" | below the cost of `exec`-ing any dynamic binary here; the no-suspension control is 272 µs |
 | "this fixes dropped logcat events / a 16.6 ms frame budget" | 0.21 dispatches/s against a pipe that holds ~392 s of events, and this is not the UI thread |
+| "`fork`+`dup2`+`execve` is interchangeable with `std::process::Command`, so the backends differ only in cost" | no, and the difference is not in the latency column: `fork` copies the **entire descriptor table**, close-on-exec bits and all. Every descriptor the daemon opens itself is `O_CLOEXEC`/`EPOLL_CLOEXEC`/`IN_CLOEXEC` so those never reach `cmd`, but a descriptor inherited from the *launcher* is unmarked, and `Command` closes those in the child while our fork path handed them over — measured on the host, a raw `open()` fd appeared as fd 3 in the forked child and in no child of `Command`. v1.5.0 now sweeps the child's table before `execve`; the claim was false for the first draft of this release, which is why it is in this table rather than a footnote |
+| "a capture is safe to quote because it came off a run" | no. One acceptance band here carried a *fourth* `std` capture, 5,386 µs, which appears in no archived output and in no earlier commit — exactly the ephemeral-`/tmp` provenance Appendix A warns about, reproduced in the section that exists to prevent it. Quote the file a number came from, or drop the number |
 
 ## Appendix A — reproducing the numbers
 
@@ -591,7 +811,7 @@ adb push tools/spawnprobe/target/aarch64-linux-android/release/spawnprobe /data/
 
 # one line per table in section 3; pipe the capture straight off the device
 adb shell /data/local/tmp/spawnprobe 60  cmd vf       # 3.1 backend ladder, 3.5 window split
-adb shell /data/local/tmp/spawnprobe 30  cmd vfsweep  # 3.2 the decisive footprint table = the §8 gate
+adb shell /data/local/tmp/spawnprobe 30  cmd vfsweep  # 3.2 the footprint sweep that bounds D1
 adb shell /data/local/tmp/spawnprobe 40  cmd env      # 3.3 envp size, in-process A/B
 adb shell /data/local/tmp/spawnprobe 40  cmd vfopen   # 3.4 adddup2 vs addopen, interleaved rounds
 adb shell /data/local/tmp/spawnprobe 40  cmd openfd   # 3.4 the same pair without USEVFORK (control)
@@ -625,11 +845,22 @@ now enforced, each rule here because breaking it produced a run that was believe
 * A row that collected nothing prints `R MISSING` and a truncated row says `!! SHORT: n of N
   samples survived`. Nothing may vanish quietly from a table that someone will quote.
 
-One structural result the vendored `ladder` mode makes visible: the cost cliff is a **step** at
-"you passed a non-NULL `file_actions` object", not a slope per action — empty 753, one `dup2`
-755, two 727, three 747 µs, against 547 µs with `NULL` actions (`true`, n=40, contended device,
-so read the pattern, not the absolutes: see §9's reproducibility bullet). That is §6.3's branch, and the
-reason D5's three `adddup2` calls cost nothing next to the one that Bionic would have run.
+One structural result the vendored `ladder` mode makes visible: the `posix_spawn` cost cliff is a
+**step** at "you passed a non-NULL `file_actions` object", not a slope per action — empty 753, one
+`dup2` 755, two 727, three 747 µs, against 547 µs with `NULL` actions (`true`, n=40, contended
+device, so read the pattern, not the absolutes: see §9's reproducibility bullet). That is §6.3's
+branch, and the reason §5.4's "we were paying for `fork()` anyway" objection is not a measurement
+artefact: Bionic runs `fork()` the moment you ask for file actions, unless forced. `fork` pays that
+cost knowingly, and with no deprecated flag left to re-verify.
+
+Two things the harness no longer settles, so nobody should look for them here. It is not an A/B of
+the daemon's own backends — D1 ships `fork`, and `MINI_LMK_SPAWN=std|fork` against the daemon is
+that A/B. And its `posix_spawn` rows are §5.4's evidence, not a path the product takes. It builds
+and runs on the host too -- `cargo run --release --manifest-path tools/spawnprobe/Cargo.toml -- 5
+true vf` -- which is how §6.4's buffer-size bug surfaced: glibc's `posix_spawnattr_t` is 336 B
+(measured, aarch64 glibc 2.43) and the probe had been handing itself 8. Off-device the `true`
+target resolves to `/bin/true` and the `cmd` target is refused, because timing a path that cannot
+exist would print failure latencies that read like a backend table.
 
 Raw captures are still not archived — `/tmp` on this machine reclaims them, and `/tmp/vf_cmd.txt`
 did vanish mid-write — but the asymmetry is gone: regenerating a table is now a `git clone` plus

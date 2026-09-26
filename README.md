@@ -85,7 +85,8 @@ mini-lmk/
 ├── package/
 │   └── axmanager/           # AxManager / Axeron module configuration and scripts
 ├── scripts/
-│   └── benchmark.sh         # On-device end-to-end workload benchmarking runner
+│   ├── benchmark.sh         # On-device end-to-end workload benchmarking runner
+│   └── check-benchmark-sh.sh # Runs benchmark.sh's reporting half under a non-bash shell
 ├── src/
 │   ├── config.rs            # Runtime configuration parsing (daemon.conf)
 │   ├── hasher.rs            # In-tree 64-bit FNV-1a hasher (zero-dependency)
@@ -106,7 +107,7 @@ mini-lmk/
 
 ## Configuration
 
-Configuration files reside under `<base>/config/` (dynamically resolved to `$MODPATH/mlmk/config/` in AxManager, or `/data/local/tmp/mlmk/config/` for standalone ADB execution) and are reloaded via `inotify` when modified. The installer creates `exclude.list` and `games.list` (both empty); `daemon.conf` is **not** shipped — until you create it, the compiled defaults in the table below are in effect, and an unreadable file silently keeps them. The module zip itself ships no configuration: `customize.sh` recreates `config/` and `logs/` and touches the two lists on every flash, so treat a hand-written `daemon.conf` (and any `log_enabled` in it) as not surviving a module upgrade and re-check it after flashing; the standalone `/data/local/tmp/mlmk/` tree is outside the module directory and is left alone.
+Configuration files reside under `<base>/config/` (dynamically resolved to `$MODPATH/mlmk/config/` in AxManager, or `/data/local/tmp/mlmk/config/` for standalone ADB execution) and are reloaded via `inotify` when modified. On startup, if `daemon.conf` is missing, the daemon automatically creates it with documented defaults (and ensures `exclude.list` and `games.list` exist as well), announces it to stdout, and loads it. You can edit `daemon.conf` live while the daemon runs without restarting.
 
 ### `daemon.conf`
 

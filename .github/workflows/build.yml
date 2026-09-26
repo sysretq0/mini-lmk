@@ -43,6 +43,14 @@ jobs:
       - name: Run Test Suite
         run: cargo test --verbose
 
+      - name: Check the benchmark script under a POSIX shell
+        # scripts/benchmark.sh is #!/system/bin/sh, which on the device is toybox ash, not
+        # bash -- and the two disagree at run time, not parse time, so `bash -n` proves
+        # nothing here. A real instance: `${CENSUS_KIND^}` passed every bash check and
+        # aborted the device run with "Bad substitution" after all the measurement work.
+        # This executes the reporting half under dash and requires byte-identical output.
+        run: sh scripts/check-benchmark-sh.sh
+
       - name: Build Spawn Probe Harness
         # tools/spawnprobe is excluded from the workspace, so nothing else in CI
         # compiles it. It is the only way to regenerate the tables in
