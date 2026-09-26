@@ -1,4 +1,5 @@
 /target
+/tools/spawnprobe/target
 /build
 /dist
 *.log

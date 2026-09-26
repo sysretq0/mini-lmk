@@ -20,3 +20,14 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 overflow-checks = false
+
+# tools/spawnprobe is deliberately NOT a member of this build. It is the harness
+# that reproduces the latency tables in docs/ROADMAP.md: it is edition 2024, it
+# hand-writes aarch64 `clone` assembly, and it links nothing the daemon may link.
+# Keeping it out of the member set is what stops `cargo test`, `cargo clippy
+# --all-targets` and `cargo fmt` from ever touching it, and stops a measurement
+# tool from becoming a build input to a shipped binary. Build it on purpose:
+#   cargo build --release --target aarch64-linux-android \
+#       --manifest-path tools/spawnprobe/Cargo.toml
+[workspace]
+exclude = ["tools/spawnprobe"]

@@ -43,6 +43,13 @@ jobs:
       - name: Run Test Suite
         run: cargo test --verbose
 
+      - name: Build Spawn Probe Harness
+        # tools/spawnprobe is excluded from the workspace, so nothing else in CI
+        # compiles it. It is the only way to regenerate the tables in
+        # docs/ROADMAP.md section 3, and a harness that has silently stopped
+        # building turns a falsifiable claim back into an unfalsifiable one.
+        run: cargo build --release --target aarch64-linux-android --manifest-path tools/spawnprobe/Cargo.toml
+
       - name: Build All Android ABIs
         run: |
           echo "=== Building aarch64-linux-android (arm64-v8a) ==="

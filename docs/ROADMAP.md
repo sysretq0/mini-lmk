@@ -67,7 +67,7 @@ family pays neither: it is 1,375–1,537 µs at every footprint in that range.
 
 ## 3. Measurements
 
-All from the out-of-tree probe crate (`/tmp/spawnprobe`, built for
+All from the probe crate now vendored at `tools/spawnprobe` (built for
 `aarch64-linux-android`, pushed to `/data/local/tmp/spawnprobe`); commands in Appendix A.
 `[parent]` is the number that stalls the reactor. `[whole]` is spawn plus `waitpid`, so it
 includes the ~30 ms the child needs to do its actual job, and is quoted only so nobody
@@ -86,7 +86,9 @@ confuses the two.
 | raw `clone(CLONE_VM)`, no suspension | 272 µs | **control only, unsafe** — prices (b) |
 
 Against today: `fork()` is 2.88x cheaper, `USEVFORK` is **3.37x** cheaper. Against
-`fork()`, `USEVFORK` is a further 1.17x.
+`fork()`, `USEVFORK` is a further 1.17x — a number this table does not support on its own:
+§9's reproducibility bullet records that same capture re-run twice, where the 1.17x came out
+0.84x and then 1.22x. Treat this section as one device's state, and §3.2 as the evidence.
 
 Two things to notice. The three `dup2` actions cost **+457 µs** when Bionic is allowed to
 downgrade to `fork()` (1,844 without the flag, 1,387 with it) — the flag is not a
@@ -308,10 +310,12 @@ its own buffer and kernel descriptors, and any Rust codegen that spills is a par
 corruption; and it re-implements the `returns_twice` contract that is precisely why Bionic's
 own `fork`/`vfork` wrappers exist. We proved it works here (the device shell domain has
 `Seccomp: 0`, `asm!` is stable, `panic = "abort"` already) — capability is not the reason for
-rejecting it, the 8.3 % is. Measurement fragility is a second signal: the asm path silently
-produced no rows in one sweep because a `OnceLock` availability probe cached a `false` under a
-load average of 12.8. A backend whose failure mode is "quietly not measured" is a backend
-whose failure mode is "quietly not shipped".
+rejecting it, the 8.3 % is. Measurement fragility is a second signal: in one sweep the asm path
+silently produced no rows because a `OnceLock` availability probe cached a `false` under a load
+average of 12.8. That trap is closed — the vendored harness never caches a failure, and a
+missing row now shouts `R MISSING` — but it generalises: a backend that is *absent* from a table
+is one careless summary away from being *wrong* in one. A backend whose failure mode is "quietly
+not measured" is a backend whose failure mode is "quietly not shipped".
 
 ### 5.6 Root fast path: `libc::kill(pid, SIGKILL)` per PID instead of spawning `cmd`
 Dead in the only deployment we ship. On the reference device `id` reports
@@ -499,7 +503,10 @@ descriptor that is never closed) rather than by weakening the assertion.
   1,600 µs at shipping footprint **and** under 2,000 µs at 1 GB of daemon RSS. The second
   clause is the point of the release; a backend that passes only the first is a regression
   dressed as a win.
-* `MINI_LMK_SPAWN=std` still works and reproduces today's ~4.7 ms, so the A/B is honest.
+* `MINI_LMK_SPAWN=std` still works and lands in the 2.9–5.4 ms band that §9 documents for
+  absolute `[parent]` P50s of the std row (2,868 / 3,736 / 4,681 / 5,386 µs across four
+  captures of the same device), so the A/B is honest without promising a reproducibility
+  that this device does not offer.
 * The startup banner distinguishes `spawn` (fast path live) from `fork` (fallback, with reason).
 * No new descriptor, no new thread, no allocation inside the dispatch loop: the `/proc/<pid>/fd`
   census and `Threads: 1` must read as they do today.
@@ -508,27 +515,48 @@ descriptor that is never closed) rather than by weakening the assertion.
 
 ## 9. Measurement hygiene, so the next reader does not repeat our mistakes
 
-Every number here comes from an out-of-tree probe crate (Appendix A). The ways it lied to us,
-in order of how long each cost us:
+Every number here comes from the probe crate at `tools/spawnprobe` (Appendix A) — vendored into
+the repo after this file shipped reproduction commands for a crate that existed only in `/tmp`.
+The ways it lied to us, in order of how long each cost us:
 
 * **Cross-run comparisons are worthless on this device.** Two rows from different processes
   differ by more than the effect we were chasing; the "+85 % from environment size" claim in
   §3.3 was an artefact of that, and every A/B since is in-process and interleaved. Where this
   document does quote across runs (§3.5's target-size pair, §5.9's `sweep` mode) it says so.
-* **Load average is a confound.** At `load average 12.8` the probe's one-shot
-  `OnceLock<bool>` availability cache latched `false`, silently deleting every raw-`clone` row
-  from a sweep that then looked like "raw clone does not scale". Negative results must never be
-  cached. Another tenant also deleted our on-device log mid-run: pull results off-device
-  immediately.
+* **A silently absent row gets read as an absent effect.** At `load average 12.8` the probe's
+  one-shot `OnceLock<bool>` availability cache latched `false`, deleting every raw-`clone` row
+  from a sweep that then looked like "raw clone does not scale". The vendored harness never
+  caches a negative, and a row that collected nothing now prints `R MISSING` while a truncated
+  one says `!! SHORT: n of N samples survived` — because the dangerous failure here was never a
+  crash, it was a column nobody noticed was gone.
+* **Another tenant deleted our on-device log mid-run.** Pull results off the device
+  immediately: pipe `adb shell` straight to the build machine, never leave the only copy in
+  `/data/local/tmp`.
 * **Never benchmark the real target at 400 iterations.** Each dispatch against
   `/system/bin/cmd activity kill` is a genuine AMS Binder round trip that dumps an exception
   stack into `system_server`'s log. n≈30–60 per step, and `AnonHugePages`/`Swap` pinned.
 * **Quote the P50 of the parent stall, not the mean of "spawn + waitpid".** The child's own
   30 ms dominates the latter, and mixing the two produced this roadmap's first wrong headline.
-* **`/tmp` on the build machine is not storage.** The probe crate and every raw capture behind
-  the tables below were reclaimed mid-investigation, twice; this file's own predecessor was
-  overwritten by a stale snapshot restore. The numbers survived only because they were
-  transcribed here — so transcribe, and commit.
+* **`/tmp` on the build machine is not storage.** Every raw capture behind the tables below was
+  reclaimed mid-investigation, twice; this file's own predecessor was overwritten by a stale
+  snapshot restore. The probe crate is now in git, so the *harness* survives; the captures do
+  not, which is why the tables here remain the record. Transcribe, then commit.
+* **Absolutes do not reproduce — and neither does one published ranking.** Three captures of
+  the *same mode* on the same device (`60 cmd vf`, API 34, `Threads: 1`, `AnonHugePages` and
+  `Swap` 0 kB, load average 12.8–14.7; the first with the pre-vendoring binary, the next two
+  minutes apart with this crate): every `[parent]` P50 landed at 0.53–0.80x of §3.1's published
+  value in the first re-run and 0.40–0.61x in the second. `fork` went 1,627 → 854 → 785 µs,
+  `USEVFORK` 1,387 → 1,019 → 646 µs, `std` 4,681 → 3,736 → 2,868 µs, the VM-only control
+  272 → 167 → 137 µs. More damaging than the drift: the ratio §3.1 quotes, "`USEVFORK` is a
+  further 1.17x over `fork`", measured 0.84x then 1.22x. At shipping footprint those two
+  backends are within device noise of each other, and their *order* is not a reproducible fact.
+  What survived all three captures is the ≥ 2x gap to `std` and the §3.2 footprint sweep
+  (`fork` 19.1x, `USEVFORK` flat) — which is where D1's rationale actually sits, and why §3.1
+  is context rather than evidence. Two rules: do not promote a same-footprint ranking of two
+  backends less than ~1.2x apart, and never quote `std` as a single number (the same capture has
+  P50 2,868 µs against P99 6,644 µs). Read any fresh absolute as "this device, right now" —
+  which is why every run now prints its own load average, RSS, thread count, API level,
+  `AnonHugePages`, `Swap` and `Seccomp` beside the rows.
 
 ## 10. Claims that must not be repeated
 
@@ -550,28 +578,59 @@ Kept because they were in a draft of this file, or in a pitch, and are now known
 
 ## Appendix A — reproducing the numbers
 
+The harness lives in the repo at `tools/spawnprobe`, deliberately **not** a workspace member
+(`[workspace] exclude` in the root `Cargo.toml`), so `cargo test`, `cargo clippy --all-targets`
+and `cargo fmt` keep operating on the daemon alone and this crate's edition-2024 code, hand
+written aarch64 `clone` assembly and `dlsym`'d Bionic symbols cannot leak into a product build.
+Building it is a separate, explicit act:
+
 ```sh
-# RSS sweep (fork vs raw clone vs std, one process, rising footprint)
-cargo build --release --target aarch64-linux-android && adb push target/aarch64-linux-android/release/spawnprobe /data/local/tmp/
-adb shell "cd /data/local/tmp && ./spawnprobe 150 true sweep"
+cargo build --release --target aarch64-linux-android \
+    --manifest-path tools/spawnprobe/Cargo.toml
+adb push tools/spawnprobe/target/aarch64-linux-android/release/spawnprobe /data/local/tmp/
 
-# backend table against the real target, interleaved at rising footprint
-adb shell "cd /data/local/tmp && ./spawnprobe 30 cmd vfsweep"
-
-# adddup2 vs addopen, both on the vfork path, 3 interleaved rounds
-adb shell "cd /data/local/tmp && ./spawnprobe 40 cmd vfopen"
-
-# do the file actions actually redirect? execs toybox ls -l /proc/self/fd
-adb shell "cd /data/local/tmp && ./spawnprobe 1 x fdcheck"
+# one line per table in section 3; pipe the capture straight off the device
+adb shell /data/local/tmp/spawnprobe 60  cmd vf       # 3.1 backend ladder, 3.5 window split
+adb shell /data/local/tmp/spawnprobe 30  cmd vfsweep  # 3.2 the decisive footprint table = the §8 gate
+adb shell /data/local/tmp/spawnprobe 40  cmd env      # 3.3 envp size, in-process A/B
+adb shell /data/local/tmp/spawnprobe 40  cmd vfopen   # 3.4 adddup2 vs addopen, interleaved rounds
+adb shell /data/local/tmp/spawnprobe 40  cmd openfd   # 3.4 the same pair without USEVFORK (control)
+adb shell /data/local/tmp/spawnprobe 1   true fdcheck # 3.4/6.3 do the file actions really redirect?
+adb shell /data/local/tmp/spawnprobe 1   true execfail # 6.2 exec failure is asynchronous
+adb shell /data/local/tmp/spawnprobe 40  true ladder  # 3.1 plus the file-action-count decomposition
+adb shell /data/local/tmp/spawnprobe 150 true sweep   # 2   fork() against the parent's own RSS
+adb shell /data/local/tmp/spawnprobe 200 true ipc     # 5.7 the socketpair round trip a helper needs
 ```
 
-Positional convention is `<iters> <true|cmd|x> <mode>`; the third argument's meaning differs
-per mode, which has already produced one silently-wrong run. The probe is deliberately
-**out of tree** — it links `libc` in ways the daemon must not, and shipping it would invite
-someone to build a product out of a measurement harness.
+Each run prints its own confounds, so a capture cannot be pasted into a claim without them:
 
-**The probe source and the raw captures are not archived** (`/tmp/spawnprobe`,
-`/tmp/vf_cmd.txt`, `/tmp/sw.txt`, `/tmp/vf{2,3,4}.txt` — this machine reclaims `/tmp`, and one
-capture vanished while this document was being written). The tables above are the record.
-Re-run the commands to regenerate, and note that `vfopen`, `vfcheck` and `execfail` modes were
-added during the investigation and are not in any committed tree.
+```
+R mode=vf -> docs/ROADMAP.md 3.1 and 3.5
+R iters=60 rss=3 MB threads=1 api=34 loadavg=13.62 anon_hugepages=0 kB swap=0 kB seccomp=0
+```
+
+The previous version of this appendix gave `./spawnprobe 1 x fdcheck` (a target that no longer
+parses, and a slot whose meaning used to change per mode) and a build line that worked only from
+the probe's own directory. Both were instructions nobody could follow, which makes the tables
+they pointed at unfalsifiable — the exact failure §9 exists to warn about. The CLI contract is
+now enforced, each rule here because breaking it produced a run that was believed:
+
+* `<iters> <true|cmd> <mode>`; only `rss` takes a fourth argument, and passing one to any other
+  mode is fatal. `vf` and `env` used to read the same positional as "iterations" and "env size"
+  respectively, which is how one suite got published as another.
+* Unknown mode or unknown target is fatal, instead of falling through to the default ladder.
+* More than 120 dispatches against the real `cmd` target is refused unless `SPAWNPROBE_FORCE=1`.
+  Each one is a Binder round trip that dumps an AMS exception into `system_server`'s log; §3.1
+  and §3.2 were built at n=60 and n=30 for that reason, not for want of patience.
+* A row that collected nothing prints `R MISSING` and a truncated row says `!! SHORT: n of N
+  samples survived`. Nothing may vanish quietly from a table that someone will quote.
+
+One structural result the vendored `ladder` mode makes visible: the cost cliff is a **step** at
+"you passed a non-NULL `file_actions` object", not a slope per action — empty 753, one `dup2`
+755, two 727, three 747 µs, against 547 µs with `NULL` actions (`true`, n=40, contended device,
+so read the pattern, not the absolutes: see §9's reproducibility bullet). That is §6.3's branch, and the
+reason D5's three `adddup2` calls cost nothing next to the one that Bionic would have run.
+
+Raw captures are still not archived — `/tmp` on this machine reclaims them, and `/tmp/vf_cmd.txt`
+did vanish mid-write — but the asymmetry is gone: regenerating a table is now a `git clone` plus
+one build command, not a reconstruction from whoever was in the room.

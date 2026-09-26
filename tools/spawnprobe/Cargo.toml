@@ -1,0 +1,27 @@
+[package]
+name = "spawnprobe"
+version = "0.1.0"
+edition = "2024"
+description = "Kill-dispatch measurement harness for docs/ROADMAP.md (not part of the daemon build)"
+license = "GPL-3.0-only"
+
+# Deliberately NOT a workspace member of the `mini-lmk` package. Nothing here is
+# linked into, tested by, or shipped with the daemon; it is built explicitly with
+# --manifest-path. See the [workspace] note in ../../Cargo.toml.
+#
+# libc is the whole dependency surface, and only for FFI types and syscalls the
+# daemon itself calls. The raw clone backend uses no libc at all (see `raw`).
+[dependencies]
+libc = "0.2"
+
+# The numbers in docs/ROADMAP.md were produced with EXACTLY this profile. Every
+# field below changes the measured latency: opt-level "z" and fat LTO change the
+# code the parent runs inside the vfork window, codegen-units = 1 changes the
+# inlining, and panic = "abort" is what makes the raw-clone child legal to write
+# without unwinding tables. Re-baseline the tables before changing any of them.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
