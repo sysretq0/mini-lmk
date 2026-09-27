@@ -92,11 +92,16 @@ mini-lmk/
 │   └── check-benchmark-sh.sh # Runs benchmark.sh's reporting half under a non-bash shell
 ├── src/
 │   ├── config.rs            # Runtime configuration parsing (daemon.conf)
+│   ├── daemon.rs            # DaemonState: bootstrap, config watching, epoll reactor
+│   ├── events.rs            # Logcat event handlers: LRU, game sessions, clock-jump rebase
 │   ├── hasher.rs            # In-tree 64-bit FNV-1a hasher (zero-dependency)
+│   ├── kill.rs              # Eviction scan and dispatch: SIGKILL fast path, AMS fallback, KillRecord
 │   ├── parser.rs            # Zero-copy epoch logcat dispatcher and event fallbacks
+│   ├── probe.rs             # Environment probes: screen state, HOME resolver, logcat health check
 │   ├── procfs.rs            # Stack-buffered /proc readers (statm, meminfo, oom_score_adj)
+│   ├── spawn.rs             # fork/execve kill dispatcher with backend override
 │   ├── telemetry.rs         # Dual-output TelemetrySink: isatty-gated table, 512 KB rotation, log_enabled off switch
-│   └── main.rs              # Epoll reactor, state machine, and eviction pipeline
+│   └── main.rs              # Crate root: CLI, signal handling, shared constants
 ├── Cargo.lock               # Deterministic dependency manifest
 ├── Cargo.toml               # Package manifest and release profile optimizations
 ├── CHANGELOG.md             # Project release history & changelog

@@ -320,7 +320,7 @@ numbers stay reproducible on old hardware.
 
 ### 5.2 Raising the minimum supported API from 24 to 28 to make the `dlsym` go away
 Rejected as a product decision. README.md:3 and `docs/ARCHITECTURE.md`:3 advertise Android
-7.0+ (API 24+), and `src/main.rs` implements genuine pre-29 paths (`dumpsys power` parsing
+7.0+ (API 24+), and `src/probe.rs` implements genuine pre-29 paths (`dumpsys power` parsing
 instead of `cmd deviceidle get screen`, HOME-category resolution instead of `RoleManager`,
 3-token versus 4-token event formats). Dropping to 28 deletes Android 7.0–8.1 support to
 avoid one `dlsym`. If anyone proposes it again, the answer is that it costs a supported release
@@ -623,7 +623,7 @@ device. Three rules fall out, each paid for in a failed test:
    outcome codes being the ones the telemetry claims; a `/dev/null` open that failed degrading to
    `Std` instead of disabling dispatch forever; and the descriptor identity check that §6.5
    explains in full, plus the inherited-descriptor claim above (which fails, reporting `[3]`, if
-   the sweep is removed). One more lives beside the record it tests, in `src/main.rs`:
+   the sweep is removed). One more lives beside the record it tests, in `src/kill.rs`:
    `kill_record_json_reports_which_of_its_four_states_spawn_errno_is`.
 5. **`scripts/benchmark.sh`** samples the daemon's `VmRSS`, its `/proc/<pid>/fd` count and its
    `Threads:` on every iteration, and prints a **drift verdict** rather than a number:

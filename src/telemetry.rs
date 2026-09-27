@@ -62,6 +62,20 @@ pub fn format_time_hms_ms(epoch_ms: u64) -> FormattedTime {
     FormattedTime(buf)
 }
 
+/// One columnar row: `HH:MM:SS.mmm   TAG   target   detail`. The single shape
+/// every tabular record takes, so the padding rule lives here and not in ten
+/// `format!` strings.
+#[inline]
+pub fn tabular_row(now_epoch: u64, tag: &str, target: &str, detail: &str) -> String {
+    format!(
+        "{:<12}   {:<12} {:<26} {}",
+        format_time_hms_ms(now_epoch),
+        tag,
+        target,
+        detail
+    )
+}
+
 /// Zero-allocation JSON string escaper. Returns Cow::Borrowed if no escaping is needed.
 #[inline]
 pub fn escape_json(s: &str) -> std::borrow::Cow<'_, str> {
