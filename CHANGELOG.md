@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.6.1] - 2026-09-27
+
+### Fixed
+- **Idle-timer ceilings (F4/F15/F19):** `t_idle_sec` is now a ceiling the screen-off harvest (30/60 s) and game/low-mem escalation (10 s) windows respect — a user preset below the hard-set value used to be *relaxed* under exactly the pressure it was tuned for, and presets above it are honored unchanged.
+- **Screen-off depth-0 harvest (F16):** `lru_protect_depth = 0` now actually disables harvesting when the screen is off instead of being overridden to 1.
+- **FG-LRU sentinel collision (F3):** the "absent from LRU" sentinel is `usize::MAX`; `fg_lru_max_depth >= 99` previously protected absent packages from harvesting forever.
+- **pid-0 events (F9):** `parse_proc_start`'s fast path rejects pid 0 like the fallback path, so garbage events no longer index swapper into `pid_to_pkg`. Package validation across all three parser paths routes through one predicate, `is_proc_name` (F10).
+- **World-writable log surfaces (F11/F21):** operations log and `.old` are `0644`, the packaged logs dir `0755` — any uid could previously rename/substitute `operations.log`.
+- **Honest telemetry (F20):** the BG_SUMMARY tabular label reads `spawn_rss=`, matching the JSON key it reports (spawn-time accumulation only; deaths never subtracted it).
+- **Silent config outcomes (F17/F23):** the `max_kills_per_pass = 0 -> 1` floor is logged like every other clamp, and clamp/floor warnings honor the preload's `quiet` — each notice printed exactly once per load instead of twice at startup.
+
+### Changed
+- **Bounded zombie reaping without idle wakeups (F22):** the F14 60 s `epoll_wait` timeout only applies while dispatched children await reap confirmation (`Spawner::reaps_pending`); at idle the reactor sleeps unbounded again, restoring the documented zero idle-wakeup invariant on a quiet device.
+- **Root SIGKILL uid revalidation (F24):** `kill(pid, SIGKILL)` now additionally checks `st_uid` of `/proc/<pid>` is an app uid (>= 10000) before signalling, closing the PID-recycle window the `oom_score_adj` re-read alone left open (the reviewer-proposed `fstat` on the adj file was measured unusable: proc files under `/proc/<pid>` are uid-0-owned for apps).
+
+### Notes
+- Per-item verdicts for the whole F1-F24 ledger (including the INTENDED/DEFERRED calls: F5, F6-F8, F12, F13, F18) live in docs/REFACTORING.md.
+
 ## [1.6.0] - 2026-09-27
 
 ### Added
