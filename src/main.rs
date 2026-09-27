@@ -51,6 +51,12 @@ const TOKEN_INOTIFY: u64 = 2;
 /// Lower bound (2020-09-13) separating an unsynchronized boot RTC from NTP-synced wall clock.
 const RTC_SYNC_FLOOR_MS: u64 = 1_600_000_000_000;
 
+/// Minimum `oom_score_adj` for the root SIGKILL fast path (AOSP `CACHED_APP_MIN_ADJ`).
+/// Below this the AMS path is used even as root: `cmd activity kill` updates AMS state
+/// properly, so service-state processes are not killed behind its back and not
+/// immediately respawned.
+const SIGKILL_MIN_ADJ: i32 = 900;
+
 struct Candidate {
     pkg: String,
     live_pids: Vec<u32>,
@@ -107,6 +113,10 @@ struct DaemonState {
     screen_on: bool,
     is_gaming: bool,
     act_mode: bool,
+    /// Effective uid 0: direct `libc::kill(pid, SIGKILL)` is available as the dispatch
+    /// method for fully cached candidates (see [`SIGKILL_MIN_ADJ`]). Shell (uid 2000)
+    /// can never signal app processes, so everything goes through AMS there.
+    is_root: bool,
     /// The kill dispatcher: which launcher was resolved at startup, its cached `/dev/null`
     /// descriptor and its argument staging. See [`spawn`]; roadmap decisions D1-D5.
     spawner: spawn::Spawner,
@@ -131,6 +141,9 @@ struct KillRecord<'a> {
     spawn_errno: Option<libc::c_int>,
     oom_score_adj: i32,
     ams_protected: bool,
+    /// Which dispatch the decision chose: `"ams"` (`cmd activity kill`) or `"sigkill"`
+    /// (root fast path). Recordable in `--observe` too, where it states what `--act` would do.
+    method: &'static str,
 }
 
 impl KillRecord<'_> {
@@ -159,7 +172,7 @@ impl KillRecord<'_> {
             Some(v) => v.to_string(),
         };
         format!(
-            r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawn_errno":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{}}}"#,
+            r#"{{"ts":{},"event":"{}","pkg":"{}","pids":{:?},"rss_freed_est_kb":{},"reason":"{}","idle_sec":{},"lru_pos":{},"spawn_errno":{},"oom_score_adj":{},"ams_protected":{},"spawn_skipped":{},"method":"{}"}}"#,
             self.ts,
             self.event,
             escape_json(self.pkg),
@@ -172,6 +185,7 @@ impl KillRecord<'_> {
             self.oom_score_adj,
             self.ams_protected,
             self.spawn_skipped(),
+            self.method,
         )
     }
 }
@@ -379,6 +393,7 @@ impl DaemonState {
             game_session_start: None,
             game_intrusion_count: 0,
             act_mode,
+            is_root: unsafe { libc::geteuid() } == 0,
             telemetry,
             json_stdout,
             no_log_cli,
@@ -1059,6 +1074,16 @@ impl DaemonState {
         (event_name, tag, sim_suffix)
     }
 
+    /// Dispatch method for an unprotected candidate: direct SIGKILL only for root and
+    /// fully cached processes, AMS for everything else.
+    fn kill_method(is_root: bool, ams_protected: bool, oom_adj: i32) -> &'static str {
+        if is_root && !ams_protected && oom_adj >= SIGKILL_MIN_ADJ {
+            "sigkill"
+        } else {
+            "ams"
+        }
+    }
+
     fn evaluate_reaping_pipeline(&mut self, now_epoch: u64) {
         let is_game = self.current_fg.as_ref().map(|p| self.games.contains(p)).unwrap_or(false);
         let is_low_mem = check_mem_critical(self.config.mem_critical_percent);
@@ -1166,6 +1191,7 @@ impl DaemonState {
                 .min()
                 .unwrap_or(0);
             let ams_protected = oom_adj < self.config.min_oom_score_adj;
+            let mut method = Self::kill_method(self.is_root, ams_protected, oom_adj);
 
             let reason = if is_game {
                 "game_mode_escalation"
@@ -1185,6 +1211,31 @@ impl DaemonState {
                 None
             } else if ams_protected {
                 Some(spawn::NOT_DISPATCHED)
+            } else if method == "sigkill" {
+                // SIGKILL has no AMS gate, so the OOM check is ours and it is re-done
+                // here, immediately before signalling: a package promoted to foreground
+                // since the scan must not be signalled. Every live PID must revalidate
+                // at or above SIGKILL_MIN_ADJ — an unreadable adj is unverified, not
+                // exempt. ESRCH after signal = exited in the gap = a successful kill.
+                let confirmed = cand
+                    .live_pids
+                    .iter()
+                    .all(|&p| read_oom_score_adj(p).is_some_and(|adj| adj >= SIGKILL_MIN_ADJ));
+                let signalled = confirmed
+                    && cand.live_pids.iter().all(|&pid| {
+                        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                        rc == 0
+                            || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    });
+                if signalled {
+                    Some(0)
+                } else {
+                    // Unverified adj or the kernel refused the signal (confined root,
+                    // EPERM): fall back to AMS, which stops the package without the
+                    // rapid respawn a direct signal would cause.
+                    method = "ams";
+                    Some(self.spawner.spawn_kill(&cand.pkg))
+                }
             } else {
                 Some(self.spawner.spawn_kill(&cand.pkg))
             };
@@ -1204,13 +1255,20 @@ impl DaemonState {
                 spawn_errno,
                 oom_score_adj: oom_adj,
                 ams_protected,
+                method,
             };
             self.telemetry.emit_with(
                 || {
                     let time_str = format_time_hms_ms(now_epoch);
                     let detail = format!(
-                        "rss={}MB  idle={}s  adj={}  lru={} [{}] {}",
-                        rss_mb, cand.idle_sec, oom_adj, cand.lru_pos, reason, sim_suffix
+                        "rss={}MB  idle={}s  adj={}  lru={} [{}] {}{}",
+                        rss_mb,
+                        cand.idle_sec,
+                        oom_adj,
+                        cand.lru_pos,
+                        reason,
+                        sim_suffix,
+                        if method == "sigkill" { "  [sigkill]" } else { "" }
                     );
                     format!("{:<12}   {:<12} {:<26} {}", time_str, tag, cand.pkg, detail)
                 },
@@ -1275,6 +1333,15 @@ impl DaemonState {
             let _ = writeln!(
                 stdout(),
                 "[DAEMON] Kill dispatch backend: {backend}{detail}"
+            );
+            let _ = writeln!(
+                stdout(),
+                "[DAEMON] Root dispatch: {}",
+                if self.is_root {
+                    "SIGKILL for adj>=900 (revalidated per PID), AMS below"
+                } else {
+                    "shell uid; AMS only"
+                }
             );
         }
 
@@ -1488,6 +1555,7 @@ Usage: mini-lmk <MODE> [OPTIONS]
 Modes:
   --observe        Run in observation mode (simulate kills, emit telemetry)
   --act            Execute real kills via `cmd activity kill --user all`
+                   (as root: SIGKILL for oom_score_adj >= 900, AMS below)
 
 Options:
   --json           Emit raw NDJSON to stdout instead of tabular columnar format
@@ -1647,6 +1715,7 @@ mod tests {
             spawn_errno: None,
             oom_score_adj: 0,
             ams_protected: false,
+            method: "ams",
         };
         let mut record = NO_RECORD;
         record.event = DaemonState::kill_telemetry_parts(act_mode, ams_protected).0;
@@ -1715,9 +1784,20 @@ mod tests {
             "the v1.4.0 boolean must not return: {json}"
         );
         assert!(
-            json.starts_with(r#"{"ts":0,"event":"kill_skipped","pkg":"","pids":[],"rss_freed_est_kb":0,"reason":"idle_expired","idle_sec":0,"lru_pos":0,"spawn_errno":-2,"oom_score_adj":0,"ams_protected":true,"spawn_skipped":true}"#),
+            json.starts_with(r#"{"ts":0,"event":"kill_skipped","pkg":"","pids":[],"rss_freed_est_kb":0,"reason":"idle_expired","idle_sec":0,"lru_pos":0,"spawn_errno":-2,"oom_score_adj":0,"ams_protected":true,"spawn_skipped":true,"method":"ams"}"#),
             "field order is the log format: {json}"
         );
+    }
+
+    #[test]
+    fn kill_method_is_sigkill_only_for_root_and_fully_cached() {
+        // The whole root fast path decision in four rows: signal only what AMS would
+        // consider safely killable anyway (cached, adj >= 900), delegate the rest.
+        assert_eq!(DaemonState::kill_method(true, false, 950), "sigkill");
+        assert_eq!(DaemonState::kill_method(true, false, 900), "sigkill");
+        assert_eq!(DaemonState::kill_method(true, false, 899), "ams");
+        assert_eq!(DaemonState::kill_method(false, false, 950), "ams");
+        assert_eq!(DaemonState::kill_method(true, true, 950), "ams");
     }
 
     #[test]
@@ -1939,6 +2019,9 @@ mod tests {
             // The test harness keeps the shipped dispatcher. It is the backend the daemon runs by
             // default, so a test that dispatches at all exercises the same code a device does.
             spawner: spawn::Spawner::new(spawn::Backend::Fork),
+            // Host tests are not root, so the SIGKILL fast path stays off and every dispatch
+            // decision below mirrors the shell deployment.
+            is_root: false,
             alive_apps: FastMap::default(),
             pid_to_pkg: FastMap::default(),
             pkg_to_pids: FastMap::default(),

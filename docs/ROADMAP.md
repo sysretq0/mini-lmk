@@ -379,7 +379,11 @@ is one careless summary away from being *wrong* in one. A backend whose failure 
 not measured" is a backend whose failure mode is "quietly not shipped".
 
 ### 5.6 Root fast path: `libc::kill(pid, SIGKILL)` per PID instead of spawning `cmd`
-Dead in the only deployment we ship. On the reference device `id` reports
+*(Superseded in v1.6.0 for root deployments only: when the daemon runs as uid 0 the
+`kill(2)` fast path exists — bounded to `oom_score_adj >= 900` with per-PID OOM
+revalidation immediately before signalling, falling back to AMS below 900. The
+objections below still stand in full for the shell deployment we ship.)*
+Dead in the rootless shell deployment. On the reference device `id` reports
 `uid=2000(shell) gid=2000(shell) context=u:r:shell:s0`, and `kill -0` against both
 `system_server` and an app PID fails with `Operation not permitted`.
 `docs/ARCHITECTURE.md` §1.5 ("SELinux Permission Boundary") already documents that stock SELinux
