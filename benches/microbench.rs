@@ -338,6 +338,16 @@ fn main() {
         procfs::read_meminfo_kb()
     }));
 
+    // 6b. procfs::check_mem_critical - the F8 question (docs/REFACTORING.md): the full
+    // per-pass pressure probe exactly as the pipeline calls it (PSI first, meminfo
+    // fallback on this host where CONFIG_PSI may be off). Measured, not assumed.
+    results.push(run_bench(
+        "procfs::check_mem_critical (full per-pass probe)",
+        warmup,
+        iterations,
+        || procfs::check_mem_critical(10),
+    ));
+
     // 7. telemetry::FormattedTime (FormattedTime)
     let mut epoch_counter = 1_774_436_400_000u64;
     results.push(run_bench("telemetry::FormattedTime (stack time format)", warmup, iterations, || {

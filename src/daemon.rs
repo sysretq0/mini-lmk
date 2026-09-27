@@ -653,8 +653,14 @@ impl DaemonState {
         let mut read_buf = [0u8; 4096];
 
         while RUNNING.load(Ordering::Relaxed) {
+            let timeout = if self.spawner.pending_child_reaps() > 0 { 60_000 } else { -1 };
             let nfds = unsafe {
-                libc::epoll_wait(self.epoll_fd, events_buf.as_mut_ptr(), events_buf.len() as i32, -1)
+                // F14 as amended by F22: sleep unbounded (-1) while nothing is pending, so the
+                // "0 idle CPU wakeups" invariant holds outside a dispatch window. A dispatched
+                // `cmd` child is normally reaped by the am_proc_died event its own kill emits;
+                // the 60 s bound exists only for the silent case where that event never lands,
+                // and stops at the end of the window it was opened by.
+                libc::epoll_wait(self.epoll_fd, events_buf.as_mut_ptr(), events_buf.len() as i32, timeout)
             };
 
             if nfds < 0 {

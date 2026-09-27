@@ -34,11 +34,12 @@ impl DaemonState {
         }
         self.telemetry.emit_with(
             || {
-                let sign = if self.session_stats.spawn_rss_kb >= 0 { "+" } else { "-" };
-                let abs_rss_mb = (self.session_stats.spawn_rss_kb.unsigned_abs() + 512) / 1024;
+                // F20: this is the spawn-side sum only — deaths are not subtracted (a
+                // death-time statm read races PID reuse), so the label must not claim a delta.
+                let rss_mb = (self.session_stats.spawn_rss_kb.unsigned_abs() + 512) / 1024;
                 let detail = format!(
-                    "interval={}s  spawns={}  deaths={}  rss_delta={}{}MB",
-                    interval_sec, self.session_stats.bg_spawns, self.session_stats.bg_deaths, sign, abs_rss_mb
+                    "interval={}s  spawns={}  deaths={}  spawn_rss={}MB",
+                    interval_sec, self.session_stats.bg_spawns, self.session_stats.bg_deaths, rss_mb
                 );
                 tabular_row(now_epoch, "BG_SUMMARY", "--", &detail)
             },

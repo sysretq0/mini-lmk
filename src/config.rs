@@ -15,7 +15,7 @@
 //
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::io::stdout;
+use std::io::{stderr, stdout};
 use std::io::Write;
 use std::sync::OnceLock;
 
@@ -132,7 +132,8 @@ mem_critical_percent = 10
 # Maximum depth of the foreground history ring buffer
 fg_lru_max_depth = 10
 
-# Deep screen-off harvesting (drops LRU depth to 1 and accelerates idle decay)
+# Deep screen-off harvesting (F15/F16: ceilings t_idle at 30/60s and lru depth at 1 —
+# can only tighten the configured baseline, never loosen it)
 screen_off_harvest = true
 
 # Eviction burst cap: maximum background apps evicted per reap pass.
@@ -177,7 +178,10 @@ impl RuntimeConfig {
         }
     }
 
-    pub fn parse_str(&mut self, text: &str) {
+    /// Parse one config body. `quiet` gates the clamp/floor notices: `DaemonState::new()`
+    /// preloads the file to read `log_enabled` before the sink exists, and the full reload
+    /// loads it again — unguarded, every clamped value printed its warning twice (F23).
+    pub fn parse_str(&mut self, text: &str, quiet: bool) {
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -216,12 +220,35 @@ impl RuntimeConfig {
                     }
                     "max_kills_per_pass" => {
                         if let Ok(num) = val.parse::<usize>() {
+                            if num == 0 {
+                                // F17 (REFACTORING.md): the floor is deliberate, the silence is not.
+                                // 0 stays 1 — a 0 here must not look applied, and it must not become
+                                // a stealth off-switch: it would silence all kill telemetry, which
+                                // reads like a dead pipeline. Pausing eviction is --observe or a
+                                // future dedicated `eviction_enabled` key, not this knob.
+                                if !quiet {
+                                    let _ = writeln!(stderr(),
+                                        "[CONFIG] max_kills_per_pass = 0 below minimum 1; using 1 (use --observe to run without kills)");
+                                }
+                            }
                             self.max_kills_per_pass = num.max(1);
                         }
                     }
                     "min_oom_score_adj" => {
                         if let Ok(num) = val.parse::<i32>() {
-                            self.min_oom_score_adj = num.clamp(500, 900);
+                            let clamped = num.clamp(500, 900);
+                            if clamped != num {
+                                // F1 (REFACTORING.md): the clamp is deliberate, the silence is not.
+                                // A value someone set to 300 must not look applied.
+                                if !quiet {
+                                    let _ = writeln!(
+                                        stderr(),
+                                        "[CONFIG] min_oom_score_adj = {} outside 500..=900; clamped to {}",
+                                        num, clamped
+                                    );
+                                }
+                            }
+                            self.min_oom_score_adj = clamped;
                         }
                     }
                     "log_enabled" => {
@@ -237,7 +264,7 @@ impl RuntimeConfig {
 
     pub fn load_from_file(&mut self, path: &str, quiet: bool) {
         if let Ok(text) = std::fs::read_to_string(path) {
-            self.parse_str(&text);
+            self.parse_str(&text, quiet);
             if !quiet {
                 let _ = writeln!(stdout(),
                     "[CONFIG] Active: t_idle={}s, lru_depth={}, mem_crit={}%, fg_lru_max={}, screen_off_harvest={}, max_kills_per_pass={}, min_oom_adj={}, log_enabled={}",
@@ -314,7 +341,7 @@ mod tests {
             # Unknown keys should be safely ignored
             invalid_key = 999
         ";
-        cfg.parse_str(content);
+        cfg.parse_str(content, true);
         assert_eq!(cfg.t_idle_sec, 60);
         assert_eq!(cfg.lru_protect_depth, 5);
         assert_eq!(cfg.mem_critical_percent, 15);
@@ -324,27 +351,31 @@ mod tests {
         assert_eq!(cfg.min_oom_score_adj, 700);
         assert!(!cfg.log_enabled);
 
+        // F17 regression: 0 is floored to 1 (kill telemetry must stay observable), never 0.
+        cfg.parse_str("max_kills_per_pass = 0\n", true);
+        assert_eq!(cfg.max_kills_per_pass, 1, "0 must not become a silent off-switch");
+
         // An unparseable value leaves the previous setting alone rather than guessing
-        cfg.parse_str("log_enabled = maybe");
+        cfg.parse_str("log_enabled = maybe", true);
         assert!(!cfg.log_enabled);
-        cfg.parse_str("log_enabled = true");
+        cfg.parse_str("log_enabled = true", true);
         assert!(cfg.log_enabled);
 
         // Enforce lower bound of 1 for max_kills_per_pass
-        cfg.parse_str("max_kills_per_pass = 0");
+        cfg.parse_str("max_kills_per_pass = 0", true);
         assert_eq!(cfg.max_kills_per_pass, 1);
 
         // Clamp min_oom_score_adj to 500..=900
-        cfg.parse_str("min_oom_score_adj = 300");
+        cfg.parse_str("min_oom_score_adj = 300", true);
         assert_eq!(cfg.min_oom_score_adj, 500);
-        cfg.parse_str("min_oom_score_adj = 1000");
+        cfg.parse_str("min_oom_score_adj = 1000", true);
         assert_eq!(cfg.min_oom_score_adj, 900);
     }
 
     #[test]
     fn test_inline_comments() {
         let mut cfg = RuntimeConfig::default();
-        cfg.parse_str("t_idle_sec = 60 # aggressive\nlru_protect_depth=2# tight");
+        cfg.parse_str("t_idle_sec = 60 # aggressive\nlru_protect_depth=2# tight", true);
         assert_eq!(cfg.t_idle_sec, 60);
         assert_eq!(cfg.lru_protect_depth, 2);
     }

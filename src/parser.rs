@@ -146,7 +146,8 @@ pub fn parse_resume_activity(payload: &str) -> Option<ResumeActivityEvent<'_>> {
     }
 
     let pkg = clean_comp.split('/').next().unwrap_or(clean_comp).trim();
-    if pkg.is_empty() || pkg.starts_with('-') || pkg.starts_with('{') || !pkg.chars().any(|c| c.is_ascii_alphabetic()) {
+    // F10: one acceptance predicate for every final package string.
+    if !is_proc_name(pkg) {
         return None;
     }
 
@@ -174,15 +175,17 @@ pub fn parse_proc_start(payload: &str) -> Option<ProcStartEvent<'_>> {
     }
 
     // Fast-path: Standard AOSP indices
+    // F9: pid 0 is rejected everywhere (swapper can never be an event target, and kill(0, sig)
+    // would signal this daemon's own process group on the root fast path).
     if let (Some(pid), Some(uid)) = (tokens[1].parse::<u32>().ok(), tokens[2].parse::<u32>().ok()) {
         let proc_name = tokens[3];
-        if proc_name.starts_with('-') {
+        if pid == 0 || !is_proc_name(proc_name) {
             return None;
         }
-        if !proc_name.is_empty() && !proc_name.starts_with('{') {
+        {
             let spawn_type = if count > 4 { tokens[4] } else { "" };
             let pkg = proc_name.split(':').next().unwrap_or(proc_name).trim();
-            if !pkg.is_empty() && !pkg.starts_with('-') {
+            if is_proc_name(pkg) {
                 return Some(ProcStartEvent {
                     proc_name,
                     pkg,
@@ -218,7 +221,7 @@ pub fn parse_proc_start(payload: &str) -> Option<ProcStartEvent<'_>> {
 
     let p_idx = proc_idx?;
     let proc_name = tokens[p_idx];
-    if proc_name.starts_with('-') {
+    if !is_proc_name(proc_name) {
         return None;
     }
     let spawn_type = if p_idx + 1 < count && !tokens[p_idx + 1].starts_with('{') {
@@ -232,7 +235,7 @@ pub fn parse_proc_start(payload: &str) -> Option<ProcStartEvent<'_>> {
     }
 
     let pkg = proc_name.split(':').next().unwrap_or(proc_name).trim();
-    if pkg.is_empty() || pkg.starts_with('-') {
+    if !is_proc_name(pkg) {
         return None;
     }
     Some(ProcStartEvent {
@@ -417,6 +420,24 @@ mod tests {
         assert_eq!(parse_logcat_line(&epoch_line("wm_resume_activity", "[0,123,1,--user/-bad.pkg.Act]")), None);
         assert_eq!(parse_logcat_line(&epoch_line("am_proc_start", "[0,1234,10001,--user,next-top-activity,{}]")), None);
         assert_eq!(parse_logcat_line(&epoch_line("am_proc_start", "[0,1234,10001,-malicious.app,service,{}]")), None);
+    }
+
+    #[test]
+    fn test_f9_reject_pid_zero_fast_path() {
+        // kill(0, SIGKILL) signals the daemon's own process group; pid 0 must never
+        // survive parsing, on the fast path or anywhere else.
+        assert_eq!(parse_logcat_line(&epoch_line("am_proc_start", "[0,0,10130,com.example.app,top-activity,{}]")), None);
+        assert_eq!(parse_logcat_line(&epoch_line("am_proc_start", "[0,0,0,com.example.app,top-activity,{}]")), None);
+    }
+
+    #[test]
+    fn test_f10_unified_pkg_acceptance() {
+        // Bare numeric and punctuation-only names have no letter and are rejected by the
+        // shared predicate on all paths (resume + proc_start fast/fallback).
+        assert_eq!(parse_logcat_line(&epoch_line("wm_resume_activity", "[0,123,1,12345/12345.Act]")), None);
+        assert_eq!(parse_logcat_line(&epoch_line("am_proc_start", "[0,1234,10001,1234,service,{}]")), None);
+        // Still accepted: standard names, and the colon process-name suffix.
+        assert!(parse_logcat_line(&epoch_line("am_proc_start", "[0,1234,10001,com.example.app:service,service,{}]")).is_some());
     }
 
     #[test]

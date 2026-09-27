@@ -152,6 +152,10 @@ pub struct Spawner {
     /// which is the claim roadmap 8 makes about this module, executed by
     /// `tests::staged_argv_is_exact_and_a_shorter_name_never_reallocates`.
     name_buf: Vec<u8>,
+    /// F22 (amends F14): dispatched children whose reap has not yet been confirmed. While this is
+    /// nonzero the reactor bounds `epoll_wait` with 60 s; at zero it sleeps at -1 again, so the
+    /// "0 idle CPU wakeups" invariant holds outside the window a dispatch opened.
+    reaps_pending: c_int,
 }
 
 impl Spawner {
@@ -166,6 +170,7 @@ impl Spawner {
             devnull_errno: 0,
             envp: Vec::new(),
             name_buf: Vec::new(),
+            reaps_pending: 0,
         };
 
         // The environment is copied once, as a pointer table; the strings stay owned by libc.
@@ -208,6 +213,18 @@ impl Spawner {
         self.note
     }
 
+    /// F22: children dispatched through this spawner and not yet confirmed reaped. The reactor
+    /// bounds its sleep by this count; `KillEngine::pending_child_reaps` is the daemon's view.
+    pub fn pending_child_reaps(&self) -> c_int {
+        self.reaps_pending
+    }
+
+    /// `reap_terminated_children` drained every exited child (waitpid returned <= 0); the
+    /// bounded-sleep window a dispatch opened is closed.
+    pub fn note_children_drained(&mut self) {
+        self.reaps_pending = 0;
+    }
+
     /// The cached `/dev/null` descriptor, for the tests that check what a child actually got.
     #[cfg(test)]
     fn devnull(&self) -> c_int {
@@ -222,7 +239,10 @@ impl Spawner {
     /// call site never waits for - waiting is the whole cost we are trying to avoid.
     pub fn spawn_kill(&mut self, pkg: &str) -> c_int {
         match self.spawn_path(CMD_PATH, &KILL_ARGS, Some(pkg)) {
-            Ok(_) => 0,
+            Ok(_) => {
+                self.reaps_pending += 1;
+                0
+            }
             Err(SpawnError::Errno(errno)) => errno,
             Err(SpawnError::Other) => -1,
         }
@@ -723,6 +743,21 @@ mod tests {
         if let Ok(pid) = spawner.spawn_path(missing, &[], None) {
             assert_eq!(exited_with(reaped(pid)), Some(127));
         }
+    }
+
+#[test]
+    fn f22_pending_counter_tracks_dispatch_and_drain() {
+        // The bounded-sleep window: open only by a dispatch that was handed a child, closed by
+        // the reap loop's drain notice. A refused dispatch must not open it.
+        let mut spawner = Spawner::new(Backend::Fork);
+        assert_eq!(spawner.pending_child_reaps(), 0);
+        assert_eq!(spawner.spawn_kill("com.example.\0bad"), libc::EINVAL);
+        assert_eq!(spawner.pending_child_reaps(), 0, "a refusal dispatches nothing");
+        if spawner.spawn_path(TRUE, &[TRUE; ARGV_SLOTS - 1], None).is_ok() {
+            assert_eq!(spawner.pending_child_reaps(), 1);
+        }
+        spawner.note_children_drained();
+        assert_eq!(spawner.pending_child_reaps(), 0);
     }
 
     #[test]

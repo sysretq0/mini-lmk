@@ -226,7 +226,7 @@ adb shell /data/local/tmp/mini-lmk --act
 adb shell "nohup sh -c 'while /data/local/tmp/mini-lmk --act; do sleep 2; done' > /data/local/tmp/mlmk/logs/stdout.log 2>&1 &"
 ```
 
-> **Note on `run-daemon.sh`:** this supervisor script targets the installed module layout only — it resolves the binary from `$MODPATH/system/bin/mini-lmk` or `$MODPATH/bin/<abi>/mini-lmk` and exports `MODPATH` (which also moves the daemon's base directory to `<script dir>/mlmk`). Copied next a bare binary it exits `binary not found`; use the inline loop above for standalone ADB runs. Every argument is forwarded to the binary, so `sh run-daemon.sh --act --no-log` reaches the daemon intact; with no arguments it starts `--act`, which is what the installer's `service.sh` gets.
+> **Note on `run-daemon.sh`:** this supervisor script targets the installed module layout only — it resolves the binary from `$MODPATH/system/bin/mini-lmk` or `$MODPATH/bin/<abi>/mini-lmk` and exports `MODPATH` (which also moves the daemon's base directory to `<script dir>/mlmk`). Copied next a bare binary it exits `binary not found`; use the inline loop above for standalone ADB runs. It is a fixed `--act` supervisor, not an invocation script: it runs exactly `"$BIN" --act` and forwards no arguments (`--no-log` and friends go in `daemon.conf` / `service.sh`, or use the inline loop above for a custom standalone run).
 
 ### Command-Line Arguments
 

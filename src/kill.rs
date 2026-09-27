@@ -19,7 +19,7 @@
 //! root SIGKILL fast path or the AMS fallback, and record what happened.
 
 use crate::daemon::DaemonState;
-use crate::procfs::{check_mem_critical, read_oom_score_adj, read_statm_rss_kb};
+use crate::procfs::{check_mem_critical, proc_is_app_uid, read_oom_score_adj, read_statm_rss_kb};
 use crate::telemetry::{escape_json, tabular_row};
 use crate::{spawn, Candidate, SIGKILL_MIN_ADJ};
 use std::cmp::Reverse;
@@ -126,23 +126,29 @@ impl DaemonState {
     /// reconciliation it performs while scanning. Also reconciles the process tables against PIDs and
     /// packages that died since the last pass.
     fn scan_candidates(&mut self, now_epoch: u64, is_game: bool, is_low_mem: bool) -> Vec<Candidate> {
+        // F16: ceiling, not override — a user who set depth 0 keeps depth 0 with the
+        // screen off; harvest may only tighten protection, never increase it.
         let effective_lru_depth = if !self.screen_on && self.config.screen_off_harvest {
-            1
+            self.config.lru_protect_depth.min(1)
         } else {
             self.config.lru_protect_depth
         };
 
+        // F19: same rule as F4/F15 — even the emergency path may only tighten the user's
+        // baseline, never loosen it. For any t_idle_sec >= 10 this is still exactly 10s.
         let t_idle_effective_sec: u64 = if is_game || is_low_mem {
-            10
+            self.config.t_idle_sec.min(10)
         } else if !self.screen_on && self.config.screen_off_harvest {
             let off_dur_sec = self
                 .screen_off_start
                 .map(|s| now_epoch.saturating_sub(s) / 1000)
                 .unwrap_or_default();
             if off_dur_sec > 60 {
-                30
+                // F15: same rule as F4 — a ceiling, not an override. Screen-off can only
+                // tighten the user's baseline, never loosen it below what they set.
+                self.config.t_idle_sec.min(30)
             } else {
-                60
+                self.config.t_idle_sec.min(60)
             }
         } else {
             let fg_dur_sec = self
@@ -266,11 +272,15 @@ impl DaemonState {
             // here, immediately before signalling: a package promoted to foreground
             // since the scan must not be signalled. Every live PID must revalidate
             // at or above SIGKILL_MIN_ADJ — an unreadable adj is unverified, not
-            // exempt. ESRCH after signal = exited in the gap = a successful kill.
+            // exempt — and still belong to an app uid (F24): a PID that died and was
+            // recycled by the kernel before am_proc_died drained would otherwise be
+            // signalled by uid-blind adj alone. ESRCH after signal = exited in the
+            // gap = a successful kill.
             let confirmed = cand
                 .live_pids
                 .iter()
-                .all(|&p| read_oom_score_adj(p).is_some_and(|adj| adj >= SIGKILL_MIN_ADJ));
+                .all(|&p| proc_is_app_uid(p)
+                    && read_oom_score_adj(p).is_some_and(|adj| adj >= SIGKILL_MIN_ADJ));
             let signalled = confirmed
                 && cand.live_pids.iter().all(|&pid| {
                     let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
@@ -377,6 +387,9 @@ impl DaemonState {
                 }
             }
         }
+        // F22: reaching here means waitpid found nothing left, so any dispatched child is reaped
+        // and the reactor may go back to sleeping at -1.
+        self.spawner.note_children_drained();
     }
 }
 
@@ -494,6 +507,48 @@ mod tests {
         assert!(
             cands.iter().any(|c| c.pkg == pkg),
             "an absent-from-LRU package must stay harvestable at any configured depth"
+        );
+    }
+
+    #[test]
+    fn test_f15_screen_off_harvest_never_loosens_user_idle() {
+        // F15 regression: screen-off harvest used to hard-set t_idle to 30/60, which for
+        // a user configured below that (aggressive preset) made screen-off LESS
+        // aggressive than screen-on. Harvest may only tighten, never loosen.
+        let (mut d, _log) = crate::daemon::test_support::daemon_for_test("screentidle", 1_700_000_000_000);
+        let pkg = "com.example.victim";
+        let pid = std::process::id() as u32;
+        d.alive_apps.insert(pkg.into(), 1); // idle 60s > any threshold
+        d.pkg_to_pids.entry(pkg.into()).or_default().insert(pid);
+        d.pkg_to_uid.insert(pkg.into(), 10_001);
+        d.config.t_idle_sec = 10;
+        d.config.screen_off_harvest = true;
+        d.screen_on = false;
+        d.screen_off_start = Some(1_700_000_000_000); // off for 10s: old code forced t_idle = 60
+
+        let cands = d.scan_candidates(1_700_000_060_000, false, false);
+        assert!(
+            cands.iter().any(|c| c.pkg == pkg),
+            "a package idle past the user's t_idle_sec must stay harvestable with the screen off"
+        );
+    }
+
+    #[test]
+    fn test_f19_low_mem_escalation_never_loosens_user_idle() {
+        // F19 regression: the emergency branch hard-set t_idle to 10s, relaxing an
+        // aggressive preset (5s) when pressure hits — the inverse of escalation.
+        let (mut d, _log) = crate::daemon::test_support::daemon_for_test("lowmemidle", 1_700_000_000_000);
+        let pkg = "com.example.victim";
+        let pid = std::process::id() as u32;
+        d.alive_apps.insert(pkg.into(), 1); // idle 7s: >= user t_idle 5, < emergency 10
+        d.pkg_to_pids.entry(pkg.into()).or_default().insert(pid);
+        d.pkg_to_uid.insert(pkg.into(), 10_001);
+        d.config.t_idle_sec = 5;
+
+        let cands = d.scan_candidates(1_700_000_007_000, false, true); // is_low_mem = true
+        assert!(
+            cands.iter().any(|c| c.pkg == pkg),
+            "under memory pressure a preset faster than the 10s emergency window must stay in force"
         );
     }
 

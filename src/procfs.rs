@@ -54,6 +54,29 @@ pub fn read_statm_rss_kb(pid: u32, page_size_kb: u64) -> u64 {
 }
 
 /// Reads /proc/<pid>/oom_score_adj.
+/// Owner uid of the process: `st_uid` of the `/proc/<pid>` directory itself.
+///
+/// fgres's production gate, verified on device: the files *inside* `/proc/<pid>`
+/// (`oom_score_adj`, `status`) are root- or 1000-owned on Android; only the
+/// directory inode carries the process uid. None when the pid is gone — which is
+/// exactly the case a caller revalidating before `kill(2)` must not proceed on.
+pub fn proc_uid(pid: u32) -> Option<u32> {
+    let mut path_buf = [0u8; 32];
+    format_proc_path(&mut path_buf, pid, "");
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(path_buf.as_ptr() as *const libc::c_char, &mut st) } != 0 {
+        return None;
+    }
+    Some(st.st_uid as u32)
+}
+
+/// Whether <pid> is still a *uid >= 10000* process: an app uid, not a recycled pid that
+/// now belongs to system_server, root, or a nobody worker. AIDs_APP_START floor; 10000
+/// is the same literal events.rs gates alive_apps on.
+pub fn proc_is_app_uid(pid: u32) -> bool {
+    proc_uid(pid).is_some_and(|uid| uid >= 10000)
+}
+
 pub fn read_oom_score_adj(pid: u32) -> Option<i32> {
     let mut path_buf = [0u8; 32];
     format_proc_path(&mut path_buf, pid, "oom_score_adj");
@@ -219,6 +242,11 @@ mod tests {
     #[test]
     fn test_read_oom_score_adj() {
         let pid = std::process::id();
+        assert_eq!(
+            proc_uid(pid),
+            Some(unsafe { libc::geteuid() } as u32),
+            "st_uid of /proc/<self> is our euid — the fgres gate, executed"
+        );
         let adj = read_oom_score_adj(pid);
         assert!(adj.is_some());
     }
