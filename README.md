@@ -1,6 +1,6 @@
 # mini-lmk
 
-An event-driven userspace memory manager for Android 7.0+ (API 24+) running under Android shell privileges (UID 2000, non-root).
+An event-driven userspace memory manager for Android 7.0+ (API 24+), rootless under Android shell privileges (UID 2000) with an optional root SIGKILL fast path.
 
 `mini-lmk` preempts kernel direct-reclaim thrashing and native `lmkd` stalls by proactively evicting stale background applications during foreground transition animations and background spawn events. Operating strictly via a single-threaded 2-file-descriptor `epoll` reactor, it maintains an operational footprint of **~1.07 MB PSS** (P50 1,099 kB, see [Verified Device Performance](#verified-device-performance)) with **0 idle CPU wakeups** between events.
 
@@ -9,6 +9,7 @@ An event-driven userspace memory manager for Android 7.0+ (API 24+) running unde
 ## Key Highlights
 
 * **Rootless / Shell-Privileged:** Operates under standard Android shell permissions (UID `2000`, `u:r:shell:s0` via ADB or Shizuku). Requires zero root, KernelSU, Magisk, or custom SELinux modifications while retaining access to the framework's `cmd activity` IPC interface and `logcat` event buffers.
+* **Optional Root SIGKILL Fast Path:** When the daemon runs as root (`uid 0`), fully cached candidates (`oom_score_adj >= 900`) are terminated directly with `libc::kill(pid, SIGKILL)` — one syscall per PID, no fork/exec IPC. Because SIGKILL bypasses the AMS gate, every live PID's `oom_score_adj` is re-read immediately before signalling, so a package promoted to foreground since the scan is never signalled. Any PID that revalidates below 900 routes the whole package back to `cmd activity kill`: below 900 the AMS path is kept even as root, because it stops processes through the framework — updating its own records — instead of triggering the rapid respawn a direct signal would cause. Shell deployments never signal directly.
 * **Stack-Buffered Tokenizer & Procfs Readers:** Parses incoming logcat event lines and `/proc` metrics (`statm`, `meminfo`, `oom_score_adj`) using fixed stack-allocated buffers and string slicing, avoiding heap allocations in the log tokenizing and procfs query paths.
 * **Event-Sourced Timekeeping (Zero Clock Syscalls per Event):** Consumes `logcat -b events -v epoch` and derives `now` from the framework event's own millisecond timestamp, so no `clock_gettime` is sampled per dispatched event and telemetry `ts` is exactly aligned with Activity Manager event time. Idle-age, LRU, and respawn math runs entirely on `u64` epoch milliseconds (line format and clock-step semantics: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §1.3, §2.3).
 * **Wall-Clock Jump Compensation:** A `clock_jump_ms` detector distinguishes real `settimeofday()`/NTP steps from ordinary quiet gaps between events, and shifts every stored anchor (`alive_apps`, `recent_deaths`, screen-state, game-session, session-start) by the same delta, so elapsed ages survive the correction without a spurious reap pass; the detector is seeded from the bootstrap clock read, so the RTC-to-NTP step is caught on the first event.
@@ -62,7 +63,9 @@ Sort Candidates Descending by RSS (/proc/<pid>/statm)
     │        ├── Refresh last_active in alive_apps (yields slot, retains audit heartbeat)
     │        └── Emit KILL_SKIP / SIM_KILL telemetry
     │
-    └── NO:  Dispatch: cmd activity kill --user all <pkg>
+    └── NO:  as root && adj >= 900: revalidate oom_score_adj per PID, then SIGKILL each live PID
+             (any PID revalidating below 900 falls back to AMS)
+             Otherwise: Dispatch: cmd activity kill --user all <pkg>
              ├── Immediately evicts package from alive_apps (prevents duplicate kills)
              └── Retains pid_to_pkg mappings (async am_proc_died consumes them for state cleanup and respawn detection)
 ```
@@ -120,7 +123,9 @@ t_idle_sec=180
 # Number of recently visited foreground packages immune from eviction
 lru_protect_depth=3
 
-# Low-memory watermark (percentage of MemTotal) triggering emergency T_idle=10s grace window
+# Low-memory watermark triggering emergency T_idle=10s grace window.
+# With kernel PSI (4.20+): percent of memory-stall time (some avg10). Otherwise:
+# percent of MemTotal (MemAvailable watermark). One knob, whichever backend answers.
 mem_critical_percent=10
 
 # Maximum depth of the foreground history ring buffer
@@ -147,7 +152,7 @@ min_oom_score_adj=900
 |---|---|---|---|
 | `t_idle_sec` | `180` | `u64` (seconds) | Background idle age before qualifying for eviction. |
 | `lru_protect_depth` | `3` | `usize` | Number of most recently used foreground apps shielded from eviction. |
-| `mem_critical_percent` | `10` | `u64` (%) | RAM watermark triggering emergency idle bypass (`T_idle = 10s` grace window). |
+| `mem_critical_percent` | `10` | `u64` (%) | Memory pressure threshold triggering emergency idle bypass (`T_idle = 10s` grace window). With kernel PSI (4.20+): percent of memory-stall time (`some avg10` from `/proc/pressure/memory`); otherwise percent of MemTotal (`MemAvailable` watermark). |
 | `fg_lru_max_depth` | `10` | `usize` | Maximum size of the foreground LRU ring buffer. |
 | `screen_off_harvest` | `true` | `bool` | Accelerates idle decay and narrows LRU depth to 1 during screen-off Doze cycles. |
 | `max_kills_per_pass` | `2` (auto-scaled) | `usize` >= 1 | Eviction burst cap. Default scales by RAM: `<=4.5GB` -> 4, `4.5-8.5GB` -> 2, `>8.5GB` -> 1. |
@@ -241,6 +246,7 @@ Live operations are formatted into aligned columns on standard output:
 --------------------------------------------------------------------------------
 14:22:01.120   FG_SWITCH    com.shopee.id              prev=com.android.settings (14.2s)
 14:22:01.126   KILL         com.google.android.youtube rss=184MB  idle=410s  adj=950  lru=4 [idle_expired]
+14:22:01.128   KILL         com.example.heavy          rss=410MB  idle=620s  adj=940  lru=6 [idle_expired]  [sigkill]
 14:22:01.127   KILL_SKIP    com.spotify.music          rss=312MB  idle=200s  adj=200  lru=5 [idle_expired] (ams_protected: spawn skipped)
 14:23:15.800   SCREEN_OFF   --                         active_session=74.6s
 14:25:40.200   SCREEN_ON    --                         sleep=144s

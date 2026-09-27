@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.6.0] - 2026-09-27
+
+### Added
+- **Root SIGKILL Fast Path:** When the daemon runs as root (`uid 0`), eligible candidates whose `min(oom_score_adj) >= 900` (`SIGKILL_MIN_ADJ`, AOSP `CACHED_APP_MIN_ADJ`) are terminated directly with `libc::kill(pid, SIGKILL)` — one syscall per PID, no fork/exec IPC. Because SIGKILL bypasses the AMS gate, every live PID's `oom_score_adj` is re-read immediately before signalling, so a package promoted to foreground since the scan is never signalled; any PID whose revalidated `oom_score_adj` is below 900 — or unreadable, e.g. it raced an exit — routes the whole package back to the AMS path, which below 900 prevents the rapid restart a direct signal would cause, and a `kill(2)` failure other than `ESRCH` (e.g. a confined root hitting `EPERM`) does the same, so a live app is never reported killed. Shell (uid 2000) deployments dispatch through `cmd activity kill --user all` exactly as before.
+- **Kill Dispatch Telemetry:** `kill` / `kill_skipped` / `simulated_kill` NDJSON records carry a new `method` field (`"ams"` or `"sigkill"`), and the terminal table marks the root path with a `[sigkill]` suffix — emitted in `--observe` too, where it reports what `--act` would do. The startup banner announces the `Root dispatch:` state (SIGKILL threshold and revalidation, or `shell uid; AMS only`).
+
+### Changed
+- **PSI-Based Memory Pressure Probe:** `check_mem_critical` now reads PSI (`/proc/pressure/memory`, kernel 4.20+) first: the emergency `T_idle = 10s` grace window triggers on `some avg10 >= mem_critical_percent` — percent of time tasks stalled waiting for memory, which surfaces thrashing earlier than `MemAvailable`, which can read healthy while direct reclaim is stalling tasks. Kernels without PSI (old kernel, `CONFIG_PSI=n`, or a denied open) fall back to the existing MemAvailable watermark unchanged. `mem_critical_percent` remains the one knob for both backends, and `0` disables the escalation entirely; the auto-created `daemon.conf` comment documents the dual semantics. MemAvailable had exactly one consumer, so no other path changes.
+
+### Documented
+- README (root highlight, eviction diagram, telemetry sample), `docs/ARCHITECTURE.md` §1.5 (root fast path contract), §2 (kill dispatch), §3 (Gate 4 dispatch method), §5 (`method` field and sample records), and a supersession note on ROADMAP §5.6, which had rejected the `kill(2)` fast path for the shell deployment we ship.
+
 ## [1.5.0] - 2026-09-26
 
 ### Added
