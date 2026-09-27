@@ -115,7 +115,52 @@ pub fn read_meminfo_kb() -> (u64, u64) {
     (total_kb, avail_kb)
 }
 
+/// Parses `some avg10` out of `/proc/pressure/memory` contents.
+/// Format: `some avg10=0.00 avg60=0.00 avg300=0.00 total=0` (then a `full` line).
+pub fn parse_psi_some_avg10(contents: &str) -> Option<f32> {
+    contents
+        .lines()
+        .find(|l| l.starts_with("some "))
+        .and_then(|l| l.split_ascii_whitespace().find(|w| w.starts_with("avg10=")))
+        .and_then(|w| w.strip_prefix("avg10="))
+        .and_then(|v| v.parse().ok())
+}
+
+/// Reads `some avg10` from /proc/pressure/memory (kernel 4.20+): the share of time some
+/// task stalled waiting for memory over the last 10 seconds. `None` = PSI absent
+/// (old kernel, `CONFIG_PSI=n`, or a denied open).
+pub fn read_memory_psi_some_avg10() -> Option<f32> {
+    let fd = unsafe {
+        libc::open(c"/proc/pressure/memory".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+    };
+    if fd < 0 {
+        return None;
+    }
+    let mut buf = [0u8; 512];
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    unsafe { libc::close(fd); }
+    if n <= 0 {
+        return None;
+    }
+    parse_psi_some_avg10(std::str::from_utf8(&buf[..n as usize]).ok()?)
+}
+
+/// Memory pressure probe, deciding the emergency `T_idle = 10s` grace window.
+///
+/// PSI (`/proc/pressure/memory`) when the kernel provides it: `some avg10` is the earliest
+/// signal of thrashing — MemAvailable can read healthy while direct reclaim is stalling
+/// tasks. Falls back to the MemAvailable watermark where PSI is absent. Either way
+/// `mem_critical_percent` is the threshold: percent of stall time (PSI) or percent of
+/// MemTotal (fallback). `0` disables the check on both probes.
 pub fn check_mem_critical(mem_critical_percent: u64) -> bool {
+    // Without this, 0 means "always emergency" under PSI (`avg10 >= 0.0` is always
+    // true) but "disabled" under the fallback — keep the two probes agreeing.
+    if mem_critical_percent == 0 {
+        return false;
+    }
+    if let Some(psi) = read_memory_psi_some_avg10() {
+        return psi >= mem_critical_percent as f32;
+    }
     let (mem_total_kb, mem_avail_kb) = read_meminfo_kb();
     if mem_total_kb > 0 {
         mem_avail_kb * 100 < mem_total_kb * mem_critical_percent
@@ -176,5 +221,18 @@ mod tests {
         let pid = std::process::id();
         let adj = read_oom_score_adj(pid);
         assert!(adj.is_some());
+    }
+
+    #[test]
+    fn test_parse_psi_some_avg10() {
+        let sample = "some avg10=12.34 avg60=0.55 avg300=0.10 total=123456789\n\
+                      full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!(parse_psi_some_avg10(sample), Some(12.34));
+        // `full`-only content is not the signal we read.
+        assert_eq!(parse_psi_some_avg10("full avg10=9.99 avg60=0.00 total=1\n"), None);
+        assert_eq!(parse_psi_some_avg10(""), None);
+        assert_eq!(parse_psi_some_avg10("some avg10=junk\n"), None);
+        // 0 disables the escalation on both probes, before any file is read.
+        assert!(!check_mem_critical(0));
     }
 }

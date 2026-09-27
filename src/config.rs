@@ -123,7 +123,10 @@ t_idle_sec = 180
 # Number of recently visited foreground packages immune from eviction
 lru_protect_depth = 3
 
-# Low-memory watermark (percentage of MemTotal) triggering emergency T_idle=10s grace window
+# Low-memory watermark triggering emergency T_idle=10s grace window.
+# With kernel PSI (4.20+): percent of memory-stall time (some avg10). Otherwise:
+# percent of MemTotal (MemAvailable watermark). One knob, whichever backend answers.
+# 0 disables the low-memory escalation entirely.
 mem_critical_percent = 10
 
 # Maximum depth of the foreground history ring buffer
